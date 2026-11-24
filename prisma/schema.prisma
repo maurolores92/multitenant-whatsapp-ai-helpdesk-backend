@@ -1,0 +1,422 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ----------------------------------------------------
+// ENUMS
+// ----------------------------------------------------
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  TECHNICIAN
+  AGENT
+}
+
+enum AiRuleCategory {
+  TONE
+  RESTRICTION
+  BUSINESS
+  ESCALATION
+}
+
+enum WhatsAppStatus {
+  DISCONNECTED
+  CONNECTING
+  CONNECTED
+}
+
+enum ConversationStatus {
+  BOT_HANDLING      // Primer contacto: la IA está interactuando y diagnosticando
+  WAITING_AGENT     // La IA determinó que necesita un humano y está en cola de espera
+  AGENT_HANDLING    // Un agente/técnico tomó la conversación
+  RESOLVED          // Conversación finalizada
+}
+
+enum SenderType {
+  CUSTOMER          // Mensaje enviado por el cliente por WhatsApp
+  BOT               // Mensaje automático del bot IA
+  AGENT             // Mensaje enviado por un agente humano desde el sistema
+  SYSTEM            // Mensaje de sistema (cambio de estado, alertas)
+}
+
+enum ServiceType {
+  REMOTE_WHATSAPP   // Asistencia técnica remota por WhatsApp
+  ONSITE_PHYSICAL   // Asistencia técnica presencial en el local / instalaciones
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum TicketStatus {
+  OPEN
+  ASSIGNED
+  IN_PROGRESS
+  WAITING_PARTS
+  RESOLVED
+  CANCELLED
+}
+
+enum EquipmentStatus {
+  ACTIVE
+  IN_REPAIR
+  DECOMMISSIONED
+}
+
+// ----------------------------------------------------
+// MULTITENANCY & USERS
+// ----------------------------------------------------
+
+model Tenant {
+  id                String          @id @default(uuid())
+  name              String
+  slug              String          @unique
+  isActive          Boolean         @default(true)
+  
+  // WhatsApp Cloud API (Meta Oficial) Configuration
+  whatsappPhoneNumberId String?         @unique // ID del número de teléfono en Meta Cloud API
+  whatsappWabaId        String?                 // WhatsApp Business Account ID (WABA)
+  whatsappAccessToken   String?         @db.Text // Token permanente de System User de Meta
+  whatsappPhone         String?                 // Número telefónico visible (ej: +5491155550199)
+  whatsappStatus        WhatsAppStatus  @default(DISCONNECTED)
+  whatsappSessionId     String?         @unique // Identificador de sesión para compatibilidad
+  whatsappQr            String?         @db.Text
+
+  
+  // AI Bot & Multi-Tenant Training Configuration (Gestión Superadmin)
+  geminiApiKey      String?         @db.Text
+  geminiModel       String          @default("gemini-2.0-flash")
+  aiTemperature     Float           @default(0.2)
+  aiSystemPrompt    String?         @db.Text
+  aiPrompt          String?         @db.Text
+  aiEnabled         Boolean         @default(true)
+  
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  users             User[]
+  customers         Customer[]
+  equipments        Equipment[]
+  conversations     Conversation[]
+  tickets           Ticket[]
+  messages          Message[]
+  auditLogs         AuditLog[]
+  notifications     Notification[]
+  aiRules           AiRule[]
+  aiKnowledgeItems  AiKnowledgeItem[]
+  aiTrainingExamples AiTrainingExample[]
+
+  @@map("tenants")
+}
+
+model User {
+  id                    String         @id @default(uuid())
+  tenantId              String?
+  tenant                Tenant?        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  name                  String
+  email                 String         @unique
+  password              String
+  role                  Role           @default(AGENT)
+  isActive              Boolean        @default(true)
+  
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  // Relaciones
+  sentMessages          Message[]      @relation("UserSentMessages")
+  assignedConversations Conversation[] @relation("UserAssignedConversations")
+  assignedTickets       Ticket[]       @relation("TechnicianAssignedTickets")
+  auditLogs             AuditLog[]
+  notifications         Notification[]
+
+  @@index([tenantId, email])
+  @@map("users")
+}
+
+// ----------------------------------------------------
+// RBAC: PERMISOS GRANULARES
+// ----------------------------------------------------
+
+model Permission {
+  id          String           @id @default(uuid())
+  code        String           @unique // ej: "READ_CHATS", "SEND_CHAT_MESSAGE"
+  name        String
+  description String?
+  category    String           // "chat", "tickets", "equipments", "admin"
+  createdAt   DateTime         @default(now())
+
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  role         Role
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([role, permissionId])
+  @@map("role_permissions")
+}
+
+// ----------------------------------------------------
+// AUDITORÍA Y TRAZABILIDAD (AuditService)
+// ----------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  tenantId  String?
+  tenant    Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  
+  action    String   // "CREATE", "UPDATE", "DELETE", "LOGIN", "TICKET_ESCALATED"
+  entity    String   // "User", "Ticket", "Conversation", "Equipment"
+  entityId  String?
+  payload   Json?
+  ipAddress String?
+  
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, entity])
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+// ----------------------------------------------------
+// NOTIFICACIONES IN-APP Y WEBSOCKETS
+// ----------------------------------------------------
+
+model Notification {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  userId    String?  // Null si es broadcast a todos los agentes del tenant
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  type      String   // "ticket.escalated", "chat.new_message", "whatsapp.disconnected"
+  title     String
+  body      String   @db.Text
+  link      String?
+  isRead    Boolean  @default(false)
+  
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, userId, isRead])
+  @@map("notifications")
+}
+
+// ----------------------------------------------------
+// CUSTOMERS & EQUIPMENT DATABASE
+// ----------------------------------------------------
+
+model Customer {
+  id            String         @id @default(uuid())
+  tenantId      String
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  name          String
+  phone         String         // Número normalizado E.164 (ej. +54911...)
+  email         String?
+  companyName   String?
+  address       String?
+  notes         String?        @db.Text
+  
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  equipments    Equipment[]
+  conversations Conversation[]
+  tickets       Ticket[]
+
+  @@unique([tenantId, phone])
+  @@index([tenantId, phone])
+  @@map("customers")
+}
+
+model Equipment {
+  id             String          @id @default(uuid())
+  tenantId       String
+  tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  customerId     String
+  customer       Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  name           String          // Nombre descriptivo (ej: Compresor 500L, Servidor Central)
+  brand          String?
+  model          String?
+  serialNumber   String?
+  specifications Json?           // Atributos variables (potencia, voltaje, año, etc.)
+  notes          String?         @db.Text
+  status         EquipmentStatus @default(ACTIVE)
+  
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  tickets        Ticket[]
+
+  @@index([tenantId, customerId])
+  @@index([tenantId, serialNumber])
+  @@map("equipments")
+}
+
+// ----------------------------------------------------
+// WHATSAPP CONVERSATIONS & MULTI-AGENT MESSAGING
+// ----------------------------------------------------
+
+model Conversation {
+  id              String             @id @default(uuid())
+  tenantId        String
+  tenant          Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  customerId      String
+  customer        Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  status          ConversationStatus @default(BOT_HANDLING)
+  
+  // Usuario humano asignado actualmente (si aplica)
+  assignedUserId  String?
+  assignedUser    User?              @relation("UserAssignedConversations", fields: [assignedUserId], references: [id])
+  
+  // Resumen del problema generado por la IA al transferir
+  aiDiagnostic    String?            @db.Text
+  
+  lastMessageAt   DateTime           @default(now())
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  messages        Message[]
+  tickets         Ticket[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, customerId])
+  @@map("conversations")
+}
+
+model Message {
+  id                String       @id @default(uuid())
+  tenantId          String
+  tenant            Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  conversationId    String
+  conversation      Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  
+  senderType        SenderType
+  
+  // IMPORTANTE: Si senderType == AGENT, aquí queda registrado QUÉ usuario lo envió
+  senderUserId      String?
+  senderUser        User?        @relation("UserSentMessages", fields: [senderUserId], references: [id])
+  
+  content           String       @db.Text
+  whatsappMessageId String?
+  mediaUrl          String?
+  mediaType         String?
+  
+  createdAt         DateTime     @default(now())
+
+  @@index([tenantId, conversationId])
+  @@index([senderUserId])
+  @@map("messages")
+}
+
+// ----------------------------------------------------
+// TICKETS DE SERVICIO TÉCNICO & ESCALACIÓN
+// ----------------------------------------------------
+
+model Ticket {
+  id                   String         @id @default(uuid())
+  tenantId             String
+  tenant               Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  customerId           String
+  customer             Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  equipmentId          String?
+  equipment            Equipment?     @relation(fields: [equipmentId], references: [id], onDelete: SetNull)
+  
+  conversationId       String?
+  conversation         Conversation?  @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  
+  title                String
+  description          String         @db.Text
+  aiDiagnostic         String?        @db.Text // Diagnóstico preliminar que generó la IA
+  
+  serviceType          ServiceType    // REMOTE_WHATSAPP o ONSITE_PHYSICAL
+  priority             TicketPriority @default(MEDIUM)
+  status               TicketStatus   @default(OPEN)
+  
+  serviceOrderNumber   String?        // Número de orden de servicio (ERP Tango u orden interna)
+  assignedTechnicianId String?
+  assignedTechnician   User?          @relation("TechnicianAssignedTickets", fields: [assignedTechnicianId], references: [id])
+  
+  resolutionNotes      String?        @db.Text
+  
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  @@index([tenantId, customerId])
+  @@index([tenantId, status])
+  @@map("tickets")
+}
+
+// ----------------------------------------------------
+// AI MODULAR TRAINING & RULES
+// ----------------------------------------------------
+
+model AiRule {
+  id          String         @id @default(uuid())
+  tenantId    String
+  tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  title       String
+  instruction String         @db.Text
+  category    AiRuleCategory @default(BUSINESS)
+  priority    Int            @default(1)
+  isActive    Boolean        @default(true)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@index([tenantId, isActive])
+  @@map("ai_rules")
+}
+
+model AiKnowledgeItem {
+  id          String   @id @default(uuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  question    String   @db.Text
+  answer      String   @db.Text
+  tags        String[]
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId, isActive])
+  @@map("ai_knowledge_items")
+}
+
+model AiTrainingExample {
+  id            String   @id @default(uuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customerInput String   @db.Text
+  idealResponse String   @db.Text
+  topic         String?
+  isApproved    Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([tenantId, isApproved])
+  @@map("ai_training_examples")
+}
