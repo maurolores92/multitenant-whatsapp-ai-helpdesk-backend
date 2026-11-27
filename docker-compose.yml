@@ -18,7 +18,7 @@ services:
       META_GRAPH_URL: ${META_GRAPH_URL:-https://graph.facebook.com}
       META_WEBHOOK_VERIFY_TOKEN: ${META_WEBHOOK_VERIFY_TOKEN:-meta_webhook_verify_token_whatsapp_crm}
       AI_PROVIDER: ${AI_PROVIDER:-gemini}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     expose:
       - "${PORT:-5000}"

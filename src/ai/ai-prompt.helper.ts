@@ -146,3 +146,28 @@ export function parseEscalationOutput(rawText: string): {
     return { replyText: replyPart.trim() || rawText.trim(), escalationPayload: null };
   }
 }
+
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+
+const DEPRECATED_GEMINI_MODELS = new Set([
+  'gemini-2.0-flash',
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
+]);
+
+/**
+ * Resuelve el modelo de Gemini vigente, reemplazando modelos retirados por el modelo por defecto.
+ */
+export function resolveGeminiModel(
+  tenantModel?: string | null,
+  envModel?: string | null,
+): string {
+  const candidates = [tenantModel, envModel, DEFAULT_GEMINI_MODEL];
+  for (const candidate of candidates) {
+    const normalized = candidate?.trim();
+    if (normalized && !DEPRECATED_GEMINI_MODELS.has(normalized)) {
+      return normalized;
+    }
+  }
+  return DEFAULT_GEMINI_MODEL;
+}

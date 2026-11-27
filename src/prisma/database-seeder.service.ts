@@ -6,6 +6,7 @@ import {
   PERMISSION_DEFINITIONS,
   ROLE_DEFAULT_PERMISSIONS,
 } from '../auth/constants/permissions.constant';
+import { DEFAULT_GEMINI_MODEL } from '../ai/ai-prompt.helper';
 
 @Injectable()
 export class DatabaseSeederService implements OnApplicationBootstrap {
@@ -191,6 +192,18 @@ export class DatabaseSeederService implements OnApplicationBootstrap {
         this.logger.log(`✔ Usuario Admin de Compañía creado: ${companyAdmin.email}`);
       }
     }
+
+    // Migrar modelos Gemini retirados en tenants existentes hacia el modelo vigente
+    await this.prisma.tenant.updateMany({
+      where: {
+        geminiModel: {
+          in: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
+        },
+      },
+      data: {
+        geminiModel: DEFAULT_GEMINI_MODEL,
+      },
+    });
 
     this.logger.log('✔ Usuarios base (Superadmin y Admin de compañía) verificados.');
   }

@@ -14,6 +14,7 @@ import { CreateAiExampleDto } from './dto/ai-example.dto';
 import {
   buildTenantAiSystemInstructions,
   parseEscalationOutput,
+  resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
 } from '../ai/ai-prompt.helper';
 
@@ -65,7 +66,10 @@ export class AiTrainingService {
     return {
       tenantId: tenant.id,
       tenantName: tenant.name,
-      geminiModel: tenant.geminiModel,
+      geminiModel: resolveGeminiModel(
+        tenant.geminiModel,
+        this.configService.get<string>('GEMINI_MODEL'),
+      ),
       aiTemperature: tenant.aiTemperature,
       aiSystemPrompt: tenant.aiSystemPrompt,
       aiEnabled: tenant.aiEnabled,
@@ -394,7 +398,10 @@ export class AiTrainingService {
 
     // Determinar API Key de Gemini: prioriza la del tenant, con fallback a la del sistema
     const apiKey = tenant.geminiApiKey?.trim() || this.configService.get<string>('GEMINI_API_KEY');
-    const model = tenant.geminiModel || 'gemini-2.0-flash';
+    const model = resolveGeminiModel(
+      tenant.geminiModel,
+      this.configService.get<string>('GEMINI_MODEL'),
+    );
     const systemInstructions = `${buildTenantAiSystemInstructions(tenant)}\n\n${TICKET_ESCALATION_PROTOCOL}`;
 
     let responseText = '';

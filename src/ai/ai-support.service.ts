@@ -19,6 +19,7 @@ import {
   buildCustomerConversationContext,
   buildTenantAiSystemInstructions,
   parseEscalationOutput,
+  resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
 } from './ai-prompt.helper';
 
@@ -173,7 +174,10 @@ export class AiSupportService {
     const { tenant, customer, recentMessages, latestMessage } = params;
 
     const apiKey = tenant.geminiApiKey?.trim() || this.configService.get<string>('GEMINI_API_KEY');
-    const geminiModel = tenant.geminiModel?.trim() || this.configService.get<string>('GEMINI_MODEL', 'gemini-2.0-flash');
+    const geminiModel = resolveGeminiModel(
+      tenant.geminiModel,
+      this.configService.get<string>('GEMINI_MODEL'),
+    );
 
     if (apiKey && apiKey !== 'your-gemini-api-key') {
       try {

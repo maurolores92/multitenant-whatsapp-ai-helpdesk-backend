@@ -119,7 +119,7 @@ model Tenant {
   
   // AI Bot & Multi-Tenant Training Configuration (Gestión Superadmin)
   geminiApiKey      String?         @db.Text
-  geminiModel       String          @default("gemini-2.0-flash")
+  geminiModel       String          @default("gemini-3.8-flash")
   aiTemperature     Float           @default(0.2)
   aiSystemPrompt    String?         @db.Text
   aiPrompt          String?         @db.Text

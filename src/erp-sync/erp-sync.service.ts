@@ -37,6 +37,9 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit() {
+    // Prueba inicial no bloqueante de conexión contra HelpCopies ERP para mostrar estado en consola
+    void this.checkConnectionsOnStartup();
+
     // Verificación inicial al iniciar (si este mes aún no corrió el ETL) y luego cada 12 horas
     this.startupCheckTimer = setTimeout(() => {
       void this.runMonthlyAutoSyncIfDue();
@@ -45,6 +48,37 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     this.monthlySchedulerTimer = setInterval(() => {
       void this.runMonthlyAutoSyncIfDue();
     }, 12 * 60 * 60 * 1000);
+  }
+
+  private async checkConnectionsOnStartup() {
+    try {
+      const integrations = await this.prisma.erpIntegration.findMany({
+        where: { isActive: true, baseUrl: { not: null } },
+        include: { tenant: { select: { name: true } } },
+      });
+
+      if (integrations.length === 0) {
+        this.logger.warn(
+          '[HelpCopies ERP] No hay integraciones ERP activas configuradas; no se probará conexión automática al inicio.',
+        );
+        return;
+      }
+
+      for (const integration of integrations) {
+        this.logger.log(
+          `[HelpCopies ERP] Verificando conexión inicial para "${integration.tenant.name}" (${integration.baseUrl})...`,
+        );
+        try {
+          await this.testConnection(integration.tenantId);
+        } catch {
+          // El detalle del fallo ya queda registrado en consola por testConnection
+        }
+      }
+    } catch (error: any) {
+      this.logger.error(
+        `[HelpCopies ERP] ✖ Error al verificar integraciones ERP en el arranque: ${this.extractErpErrorMessage(error)}`,
+      );
+    }
   }
 
   onModuleDestroy() {
@@ -187,7 +221,18 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
+    this.logger.log(
+      `[HelpCopies ERP] Configuración guardada para tenant ${tenantId} (URL: ${saved.baseUrl || 'N/A'}, Activa: ${saved.isActive})`,
+    );
+
     return this.getConfig(tenantId);
+  }
+
+  private extractErpErrorMessage(error: any): string {
+    const status = error?.response?.status;
+    const rawMsg = error?.response?.data?.message;
+    const msg = (Array.isArray(rawMsg) ? rawMsg.join(', ') : rawMsg) || error?.message || 'Error de conexión';
+    return status ? `HTTP ${status}: ${msg}` : msg;
   }
 
   async getProblems(tenantId: string) {
@@ -220,64 +265,107 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
         throw new BadRequestException('Faltan usuario o contraseña para autenticar contra HelpCopies ERP');
       }
       const loginUrl = joinErpUrl(integration.baseUrl, integration.loginEndpoint || '/auth/login');
-      const authRes = await firstValueFrom(
-        this.httpService.post(loginUrl, {
-          username: integration.username,
-          password: integration.password,
-        }),
-      );
-      const token =
-        authRes.data?.access_token ||
-        authRes.data?.accessToken ||
-        authRes.data?.token ||
-        authRes.data?.jwt ||
-        authRes.data?.data?.access_token ||
-        authRes.data?.data?.accessToken ||
-        authRes.data?.data?.token;
-      if (!token) {
-        throw new BadRequestException('El login de HelpCopies ERP no devolvió un token válido');
+      try {
+        const authRes = await firstValueFrom(
+          this.httpService.post(loginUrl, {
+            username: integration.username,
+            password: integration.password,
+          }),
+        );
+        const token =
+          authRes.data?.access_token ||
+          authRes.data?.accessToken ||
+          authRes.data?.token ||
+          authRes.data?.jwt ||
+          authRes.data?.data?.access_token ||
+          authRes.data?.data?.accessToken ||
+          authRes.data?.data?.token;
+        if (!token) {
+          this.logger.error(`[HelpCopies ERP] ✖ Login sin token válido en ${loginUrl}`);
+          throw new BadRequestException('El login de HelpCopies ERP no devolvió un token válido');
+        }
+        this.logger.log(`[HelpCopies ERP] ✔ Autenticación exitosa contra ${loginUrl}`);
+        headers.Authorization = `Bearer ${token}`;
+      } catch (error: any) {
+        if (error instanceof BadRequestException) throw error;
+        this.logger.error(
+          `[HelpCopies ERP] ✖ Error de autenticación en ${loginUrl}: ${this.extractErpErrorMessage(error)}`,
+        );
+        throw error;
       }
-      headers.Authorization = `Bearer ${token}`;
     }
 
     return headers;
   }
 
+  private async probeEndpoint(
+    label: string,
+    baseUrl: string,
+    endpoint: string,
+    headers: Record<string, string>,
+  ) {
+    const url = joinErpUrl(baseUrl, endpoint);
+    try {
+      const response = await firstValueFrom(this.httpService.get(url, { headers }));
+      const unwrapped = unwrapErpCollection(response.data);
+      const detected = unwrapped.total ?? unwrapped.items.length;
+      this.logger.log(`[HelpCopies ERP] ✔ ${label} conectado correctamente (${url}) -> ${detected} registros`);
+      return { ok: true as const, detected, items: unwrapped.items, url };
+    } catch (error: any) {
+      const detail = this.extractErpErrorMessage(error);
+      this.logger.error(`[HelpCopies ERP] ✖ Falló conexión a ${label} (${url}): ${detail}`);
+      return { ok: false as const, detail, url };
+    }
+  }
+
   private async fetchCollection(
+    label: string,
     baseUrl: string,
     endpoint: string,
     headers: Record<string, string>,
     paginateIfWrapped = false,
   ): Promise<Record<string, any>[]> {
     const firstUrl = joinErpUrl(baseUrl, endpoint);
-    const firstRes = await firstValueFrom(this.httpService.get(firstUrl, { headers }));
-    const firstUnwrapped = unwrapErpCollection(firstRes.data);
+    try {
+      const firstRes = await firstValueFrom(this.httpService.get(firstUrl, { headers }));
+      const firstUnwrapped = unwrapErpCollection(firstRes.data);
 
-    if (
-      !paginateIfWrapped ||
-      firstUnwrapped.total === null ||
-      firstUnwrapped.items.length >= firstUnwrapped.total ||
-      firstUnwrapped.items.length === 0
-    ) {
-      return firstUnwrapped.items;
+      if (
+        !paginateIfWrapped ||
+        firstUnwrapped.total === null ||
+        firstUnwrapped.items.length >= firstUnwrapped.total ||
+        firstUnwrapped.items.length === 0
+      ) {
+        this.logger.log(
+          `[HelpCopies ERP] ✔ ${label} obtenidos (${firstUrl}) -> ${firstUnwrapped.items.length} registros`,
+        );
+        return firstUnwrapped.items;
+      }
+
+      // Si /clients viene paginado ({ data, total }), recorremos las páginas siguientes
+      const collected = [...firstUnwrapped.items];
+      const pageSize = firstUnwrapped.items.length;
+      const totalPages = Math.ceil(firstUnwrapped.total / pageSize);
+      const separator = firstUrl.includes('?') ? '&' : '?';
+
+      for (let page = 2; page <= Math.min(totalPages, 100); page++) {
+        const pageUrl = `${firstUrl}${separator}page=${page}&limit=${pageSize}`;
+        const pageRes = await firstValueFrom(this.httpService.get(pageUrl, { headers }));
+        const next = unwrapErpCollection(pageRes.data);
+        if (next.items.length === 0) break;
+        collected.push(...next.items);
+        if (collected.length >= firstUnwrapped.total) break;
+      }
+
+      this.logger.log(
+        `[HelpCopies ERP] ✔ ${label} obtenidos (${firstUrl}) -> ${collected.length} registros`,
+      );
+      return collected;
+    } catch (error: any) {
+      const detail = this.extractErpErrorMessage(error);
+      this.logger.error(`[HelpCopies ERP] ✖ No se pudieron obtener ${label} (${firstUrl}): ${detail}`);
+      throw error;
     }
-
-    // Si /clients viene paginado ({ data, total }), recorremos las páginas siguientes
-    const collected = [...firstUnwrapped.items];
-    const pageSize = firstUnwrapped.items.length;
-    const totalPages = Math.ceil(firstUnwrapped.total / pageSize);
-    const separator = firstUrl.includes('?') ? '&' : '?';
-
-    for (let page = 2; page <= Math.min(totalPages, 100); page++) {
-      const pageUrl = `${firstUrl}${separator}page=${page}&limit=${pageSize}`;
-      const pageRes = await firstValueFrom(this.httpService.get(pageUrl, { headers }));
-      const next = unwrapErpCollection(pageRes.data);
-      if (next.items.length === 0) break;
-      collected.push(...next.items);
-      if (collected.length >= firstUnwrapped.total) break;
-    }
-
-    return collected;
   }
 
   private async upsertCustomerRow(
@@ -349,35 +437,51 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
   async testConnection(tenantId: string) {
     const integration = await this.prisma.erpIntegration.findUnique({ where: { tenantId } });
     if (!integration?.baseUrl) {
+      this.logger.warn(
+        `[HelpCopies ERP] ✖ Prueba de conexión abortada (tenant ${tenantId}): URL base no configurada`,
+      );
       throw new BadRequestException('Configura y guarda la URL del backend HelpCopies ERP antes de probar');
     }
 
+    this.logger.log(`[HelpCopies ERP] Probando conexión con ${integration.baseUrl} (tenant ${tenantId})...`);
+
     try {
       const headers = await this.buildHeaders(integration);
-      const [customersRaw, equipmentsRaw, problemsRaw] = await Promise.all([
-        firstValueFrom(this.httpService.get(joinErpUrl(integration.baseUrl, integration.customersEndpoint), { headers })),
-        firstValueFrom(this.httpService.get(joinErpUrl(integration.baseUrl, integration.equipmentsEndpoint), { headers })),
-        firstValueFrom(this.httpService.get(joinErpUrl(integration.baseUrl, integration.problemsEndpoint), { headers })),
+      const [customersProbe, equipmentsProbe, problemsProbe] = await Promise.all([
+        this.probeEndpoint('Clientes', integration.baseUrl, integration.customersEndpoint, headers),
+        this.probeEndpoint('Equipos', integration.baseUrl, integration.equipmentsEndpoint, headers),
+        this.probeEndpoint('Problemas', integration.baseUrl, integration.problemsEndpoint, headers),
       ]);
 
-      const cUnwrapped = unwrapErpCollection(customersRaw.data);
-      const eUnwrapped = unwrapErpCollection(equipmentsRaw.data);
-      const pUnwrapped = unwrapErpCollection(problemsRaw.data);
+      const failed = [
+        !customersProbe.ok ? `Clientes (${customersProbe.detail})` : null,
+        !equipmentsProbe.ok ? `Equipos (${equipmentsProbe.detail})` : null,
+        !problemsProbe.ok ? `Problemas (${problemsProbe.detail})` : null,
+      ].filter(Boolean);
+
+      if (failed.length > 0 || !customersProbe.ok || !equipmentsProbe.ok || !problemsProbe.ok) {
+        throw new BadRequestException(`No se pudo conectar con HelpCopies ERP: ${failed.join(' | ')}`);
+      }
+
+      this.logger.log(
+        `[HelpCopies ERP] ✔ Conexión exitosa para tenant ${tenantId} | Clientes: ${customersProbe.detected} | Equipos: ${equipmentsProbe.detected} | Problemas: ${problemsProbe.detected}`,
+      );
 
       return {
         connected: true,
-        customersDetected: cUnwrapped.total ?? cUnwrapped.items.length,
-        equipmentsDetected: eUnwrapped.total ?? eUnwrapped.items.length,
-        problemsDetected: pUnwrapped.total ?? pUnwrapped.items.length,
+        customersDetected: customersProbe.detected,
+        equipmentsDetected: equipmentsProbe.detected,
+        problemsDetected: problemsProbe.detected,
         sampleKeys: {
-          customer: cUnwrapped.items[0] ? Object.keys(cUnwrapped.items[0]).slice(0, 8) : [],
-          equipment: eUnwrapped.items[0] ? Object.keys(eUnwrapped.items[0]).slice(0, 8) : [],
-          problem: pUnwrapped.items[0] ? Object.keys(pUnwrapped.items[0]).slice(0, 8) : [],
+          customer: customersProbe.items[0] ? Object.keys(customersProbe.items[0]).slice(0, 8) : [],
+          equipment: equipmentsProbe.items[0] ? Object.keys(equipmentsProbe.items[0]).slice(0, 8) : [],
+          problem: problemsProbe.items[0] ? Object.keys(problemsProbe.items[0]).slice(0, 8) : [],
         },
       };
     } catch (error: any) {
-      const rawMsg = error?.response?.data?.message;
-      const detail = (Array.isArray(rawMsg) ? rawMsg.join(', ') : rawMsg) || error?.message || 'Error de conexión';
+      if (error instanceof BadRequestException) throw error;
+      const detail = this.extractErpErrorMessage(error);
+      this.logger.error(`[HelpCopies ERP] ✖ No se pudo conectar con HelpCopies ERP (${integration.baseUrl}): ${detail}`);
       throw new BadRequestException(`No se pudo conectar con HelpCopies ERP: ${detail}`);
     }
   }
@@ -389,10 +493,16 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
 
     const integration = await this.prisma.erpIntegration.findUnique({ where: { tenantId } });
     if (!integration?.baseUrl) {
+      this.logger.warn(
+        `[HelpCopies ERP] ✖ Sincronización abortada (tenant ${tenantId}): URL o endpoints no configurados`,
+      );
       throw new BadRequestException('Configura la URL y endpoints de HelpCopies ERP antes de sincronizar');
     }
 
     this.runningTenants.add(tenantId);
+    this.logger.log(
+      `[HelpCopies ERP] Iniciando sincronización (Clientes, Equipos, Problemas) desde ${integration.baseUrl} para tenant ${tenantId}...`,
+    );
 
     const summary = {
       customersCreated: 0,
@@ -408,9 +518,9 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     try {
       const headers = await this.buildHeaders(integration);
       const [customersRaw, equipmentsRaw, problemsRaw] = await Promise.all([
-        this.fetchCollection(integration.baseUrl, integration.customersEndpoint, headers, true),
-        this.fetchCollection(integration.baseUrl, integration.equipmentsEndpoint, headers, false),
-        this.fetchCollection(integration.baseUrl, integration.problemsEndpoint, headers, false),
+        this.fetchCollection('Clientes', integration.baseUrl, integration.customersEndpoint, headers, true),
+        this.fetchCollection('Equipos', integration.baseUrl, integration.equipmentsEndpoint, headers, false),
+        this.fetchCollection('Problemas', integration.baseUrl, integration.problemsEndpoint, headers, false),
       ]);
 
       const customerIdByCode = new Map<string, string>();
@@ -571,11 +681,16 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
         link: '/companies',
       });
 
+      this.logger.log(
+        `[HelpCopies ERP] ✔ Sincronización completada para tenant ${tenantId} | Clientes: +${summary.customersCreated}/~${summary.customersUpdated} | Equipos: +${summary.equipmentsCreated}/~${summary.equipmentsUpdated} (huérfanos: ${summary.equipmentsOrphan}) | Problemas: +${summary.problemsCreated}/~${summary.problemsUpdated}`,
+      );
+
       return summary;
     } catch (error: any) {
-      const rawMsg = error?.response?.data?.message;
-      const detail = (Array.isArray(rawMsg) ? rawMsg.join(', ') : rawMsg) || error?.message || 'Error en ETL';
+      const detail = this.extractErpErrorMessage(error);
       summary.errors.push(detail);
+
+      this.logger.error(`[HelpCopies ERP] ✖ Falló la sincronización para tenant ${tenantId}: ${detail}`);
 
       await this.prisma.erpIntegration.update({
         where: { tenantId },
