@@ -13,6 +13,7 @@ import { CreateAiKnowledgeDto, UpdateAiKnowledgeDto } from './dto/ai-knowledge.d
 import { CreateAiExampleDto } from './dto/ai-example.dto';
 import {
   buildTenantAiSystemInstructions,
+  callGeminiWithRetry,
   parseEscalationOutput,
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
@@ -410,14 +411,16 @@ export class AiTrainingService {
     if (apiKey && apiKey !== 'your-gemini-api-key') {
       try {
         const client = new GoogleGenAI({ apiKey });
-        const res = await client.models.generateContent({
-          model,
-          contents: `Mensaje recibido del cliente en el simulador:\n"${message}"`,
-          config: {
-            systemInstruction: systemInstructions,
-            temperature: tenant.aiTemperature ?? 0.2,
-          },
-        });
+        const res = await callGeminiWithRetry(() =>
+          client.models.generateContent({
+            model,
+            contents: `Mensaje recibido del cliente en el simulador:\n"${message}"`,
+            config: {
+              systemInstruction: systemInstructions,
+              temperature: tenant.aiTemperature ?? 0.2,
+            },
+          }),
+        );
         const parsed = parseEscalationOutput(res.text || '');
         responseText = parsed.escalationPayload
           ? `${parsed.replyText}\n\n[Simulación de Ticket IA]: ${JSON.stringify(parsed.escalationPayload)}`

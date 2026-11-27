@@ -171,3 +171,33 @@ export function resolveGeminiModel(
   }
   return DEFAULT_GEMINI_MODEL;
 }
+
+/**
+ * Ejecuta una llamada a Gemini con reintentos breves ante picos temporales de demanda (503 / 429).
+ */
+export async function callGeminiWithRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 2,
+  baseDelayMs = 1200,
+): Promise<T> {
+  let lastError: any;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const msg = String(err?.message || '');
+      const isTransient =
+        err?.status === 503 ||
+        err?.status === 429 ||
+        msg.includes('"code":503') ||
+        msg.includes('"code":429') ||
+        msg.includes('UNAVAILABLE');
+      if (!isTransient || attempt === maxRetries) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}

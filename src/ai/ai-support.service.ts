@@ -18,6 +18,7 @@ import {
 import {
   buildCustomerConversationContext,
   buildTenantAiSystemInstructions,
+  callGeminiWithRetry,
   parseEscalationOutput,
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
@@ -190,14 +191,16 @@ export class AiSupportService {
           latestMessage,
         });
 
-        const response = await client.models.generateContent({
-          model: geminiModel,
-          contents: userContext,
-          config: {
-            systemInstruction: systemInstructions,
-            temperature: tenant.aiTemperature ?? 0.2,
-          },
-        });
+        const response = await callGeminiWithRetry(() =>
+          client.models.generateContent({
+            model: geminiModel,
+            contents: userContext,
+            config: {
+              systemInstruction: systemInstructions,
+              temperature: tenant.aiTemperature ?? 0.2,
+            },
+          }),
+        );
 
         const { replyText, escalationPayload } = parseEscalationOutput(response.text || '');
 
