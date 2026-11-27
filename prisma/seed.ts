@@ -4,8 +4,12 @@ import {
   PERMISSION_DEFINITIONS,
   ROLE_DEFAULT_PERMISSIONS,
 } from '../src/auth/constants/permissions.constant';
+import { syncDatabaseUrlEnv } from '../src/prisma/database-url';
 
-const prisma = new PrismaClient();
+const databaseUrl = syncDatabaseUrlEnv();
+const prisma = new PrismaClient(
+  databaseUrl ? { datasources: { db: { url: databaseUrl } } } : undefined,
+);
 
 async function main() {
   console.log('--- Iniciando Seeder Completo ---');

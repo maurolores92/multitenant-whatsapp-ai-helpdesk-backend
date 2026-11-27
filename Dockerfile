@@ -41,4 +41,4 @@ COPY --from=builder /app/dist ./dist
 
 EXPOSE 5000
 
-CMD ["sh", "-c", "pnpm exec prisma db push --skip-generate && pnpm start:prod"]
+CMD ["sh", "-c", "DB_URL=$(node -e \"process.stdout.write(require('./dist/src/prisma/database-url').resolveDatabaseUrl() || '')\") && if [ -n \"$DB_URL\" ]; then export DATABASE_URL=\"$DB_URL\"; fi && pnpm exec prisma db push --skip-generate && pnpm start:prod"]
