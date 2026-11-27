@@ -6,6 +6,7 @@ import {
   Delete,
   Param,
   Body,
+  Query,
   UseGuards,
   ForbiddenException,
 } from '@nestjs/common';
@@ -15,27 +16,36 @@ import { CreateAiRuleDto, UpdateAiRuleDto } from './dto/ai-rule.dto';
 import { CreateAiKnowledgeDto, UpdateAiKnowledgeDto } from './dto/ai-knowledge.dto';
 import { CreateAiExampleDto, SimulateAiDto } from './dto/ai-example.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { PermissionsGuard } from '../auth/guards/permissions.guard';
+import { RequirePermissions } from '../auth/decorators/require-permissions.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
-import { Role } from '@prisma/client';
+import { PERMISSIONS } from '../auth/constants/permissions.constant';
+import { AgentArea, Role } from '@prisma/client';
 
 @Controller('tenants/:tenantId/ai-training')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+@RequirePermissions(PERMISSIONS.MANAGE_TECHNICAL_AI)
 export class AiTrainingController {
   constructor(private readonly aiTrainingService: AiTrainingService) {}
 
-  private checkSuperAdmin(user: any) {
-    if (user.role !== Role.SUPER_ADMIN) {
+  private assertTenantAccess(tenantId: string, user: any) {
+    if (user.role !== Role.SUPER_ADMIN && user.tenantId !== tenantId) {
       throw new ForbiddenException(
-        'Solo el Superadministrador puede acceder a la configuración y entrenamiento de IA de las compañías',
+        'No tienes acceso a la configuración y entrenamiento de IA de esta empresa',
       );
     }
   }
 
   // 1. Configuración de IA y API Key
   @Get('config')
-  async getAiConfig(@Param('tenantId') tenantId: string, @CurrentUser() user: any) {
-    this.checkSuperAdmin(user);
-    return this.aiTrainingService.getAiConfig(tenantId);
+  async getAiConfig(
+    @Param('tenantId') tenantId: string,
+    @CurrentUser() user: any,
+    @Query('agentId') agentId?: string,
+    @Query('area') area?: AgentArea,
+  ) {
+    this.assertTenantAccess(tenantId, user);
+    return this.aiTrainingService.getAiConfig(tenantId, { agentId, area });
   }
 
   @Patch('config')
@@ -43,16 +53,23 @@ export class AiTrainingController {
     @Param('tenantId') tenantId: string,
     @Body() dto: UpdateAiConfigDto,
     @CurrentUser() user: any,
+    @Query('agentId') agentId?: string,
+    @Query('area') area?: AgentArea,
   ) {
-    this.checkSuperAdmin(user);
-    return this.aiTrainingService.updateAiConfig(tenantId, dto, user.id);
+    this.assertTenantAccess(tenantId, user);
+    return this.aiTrainingService.updateAiConfig(tenantId, dto, user.id, { agentId, area });
   }
 
   // 2. Reglas de Comportamiento
   @Get('rules')
-  async getRules(@Param('tenantId') tenantId: string, @CurrentUser() user: any) {
-    this.checkSuperAdmin(user);
-    return this.aiTrainingService.getRules(tenantId);
+  async getRules(
+    @Param('tenantId') tenantId: string,
+    @CurrentUser() user: any,
+    @Query('agentId') agentId?: string,
+    @Query('area') area?: AgentArea,
+  ) {
+    this.assertTenantAccess(tenantId, user);
+    return this.aiTrainingService.getRules(tenantId, { agentId, area });
   }
 
   @Post('rules')
@@ -60,9 +77,11 @@ export class AiTrainingController {
     @Param('tenantId') tenantId: string,
     @Body() dto: CreateAiRuleDto,
     @CurrentUser() user: any,
+    @Query('agentId') agentId?: string,
+    @Query('area') area?: AgentArea,
   ) {
-    this.checkSuperAdmin(user);
-    return this.aiTrainingService.createRule(tenantId, dto, user.id);
+    this.assertTenantAccess(tenantId, user);
+    return this.aiTrainingService.createRule(tenantId, dto, user.id, { agentId, area });
   }
 
   @Patch('rules/:ruleId')
@@ -72,7 +91,7 @@ export class AiTrainingController {
     @Body() dto: UpdateAiRuleDto,
     @CurrentUser() user: any,
   ) {
-    this.checkSuperAdmin(user);
+    this.assertTenantAccess(tenantId, user);
     return this.aiTrainingService.updateRule(tenantId, ruleId, dto, user.id);
   }
 
@@ -82,15 +101,20 @@ export class AiTrainingController {
     @Param('ruleId') ruleId: string,
     @CurrentUser() user: any,
   ) {
-    this.checkSuperAdmin(user);
+    this.assertTenantAccess(tenantId, user);
     return this.aiTrainingService.deleteRule(tenantId, ruleId, user.id);
   }
 
   // 3. Base de Conocimiento (FAQs)
   @Get('knowledge')
-  async getKnowledge(@Param('tenantId') tenantId: string, @CurrentUser() user: any) {
-    this.checkSuperAdmin(user);
-    return this.aiTrainingService.getKnowledgeItems(tenantId);
+  async getKnowledge(
+    @Param('tenantId') tenantId: string,
+    @CurrentUser() user: any,
+    @Query('agentId') agentId?: string,
+    @Query('area') area?: AgentArea,
+  ) {
+    this.assertTenantAccess(tenantId, user);
+    return this.aiTrainingService.getKnowledgeItems(tenantId, { agentId, area });
   }
 
   @Post('knowledge')
@@ -98,9 +122,11 @@ export class AiTrainingController {
     @Param('tenantId') tenantId: string,
     @Body() dto: CreateAiKnowledgeDto,
     @CurrentUser() user: any,
+    @Query('agentId') agentId?: string,
+    @Query('area') area?: AgentArea,
   ) {
-    this.checkSuperAdmin(user);
-    return this.aiTrainingService.createKnowledgeItem(tenantId, dto, user.id);
+    this.assertTenantAccess(tenantId, user);
+    return this.aiTrainingService.createKnowledgeItem(tenantId, dto, user.id, { agentId, area });
   }
 
   @Patch('knowledge/:itemId')
@@ -110,7 +136,7 @@ export class AiTrainingController {
     @Body() dto: UpdateAiKnowledgeDto,
     @CurrentUser() user: any,
   ) {
-    this.checkSuperAdmin(user);
+    this.assertTenantAccess(tenantId, user);
     return this.aiTrainingService.updateKnowledgeItem(tenantId, itemId, dto, user.id);
   }
 
@@ -120,15 +146,20 @@ export class AiTrainingController {
     @Param('itemId') itemId: string,
     @CurrentUser() user: any,
   ) {
-    this.checkSuperAdmin(user);
+    this.assertTenantAccess(tenantId, user);
     return this.aiTrainingService.deleteKnowledgeItem(tenantId, itemId, user.id);
   }
 
   // 4. Ejemplos de Entrenamiento (Few-Shot)
   @Get('examples')
-  async getExamples(@Param('tenantId') tenantId: string, @CurrentUser() user: any) {
-    this.checkSuperAdmin(user);
-    return this.aiTrainingService.getExamples(tenantId);
+  async getExamples(
+    @Param('tenantId') tenantId: string,
+    @CurrentUser() user: any,
+    @Query('agentId') agentId?: string,
+    @Query('area') area?: AgentArea,
+  ) {
+    this.assertTenantAccess(tenantId, user);
+    return this.aiTrainingService.getExamples(tenantId, { agentId, area });
   }
 
   @Post('examples')
@@ -136,9 +167,11 @@ export class AiTrainingController {
     @Param('tenantId') tenantId: string,
     @Body() dto: CreateAiExampleDto,
     @CurrentUser() user: any,
+    @Query('agentId') agentId?: string,
+    @Query('area') area?: AgentArea,
   ) {
-    this.checkSuperAdmin(user);
-    return this.aiTrainingService.createExample(tenantId, dto, user.id);
+    this.assertTenantAccess(tenantId, user);
+    return this.aiTrainingService.createExample(tenantId, dto, user.id, { agentId, area });
   }
 
   @Delete('examples/:exampleId')
@@ -147,7 +180,7 @@ export class AiTrainingController {
     @Param('exampleId') exampleId: string,
     @CurrentUser() user: any,
   ) {
-    this.checkSuperAdmin(user);
+    this.assertTenantAccess(tenantId, user);
     return this.aiTrainingService.deleteExample(tenantId, exampleId, user.id);
   }
 
@@ -157,8 +190,10 @@ export class AiTrainingController {
     @Param('tenantId') tenantId: string,
     @Body() dto: SimulateAiDto,
     @CurrentUser() user: any,
+    @Query('agentId') agentId?: string,
+    @Query('area') area?: AgentArea,
   ) {
-    this.checkSuperAdmin(user);
-    return this.aiTrainingService.simulate(tenantId, dto.message);
+    this.assertTenantAccess(tenantId, user);
+    return this.aiTrainingService.simulate(tenantId, dto.message, { agentId, area });
   }
 }

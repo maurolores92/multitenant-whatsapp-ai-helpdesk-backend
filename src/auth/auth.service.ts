@@ -3,6 +3,7 @@ import {
   ConflictException,
   UnauthorizedException,
   BadRequestException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
@@ -11,6 +12,7 @@ import { AuditService } from '../audit/audit.service';
 import { RegisterTenantDto } from './dto/register-tenant.dto';
 import { LoginDto } from './dto/login.dto';
 import { Role } from '@prisma/client';
+import { getPrimaryTenant, resolveEffectivePermissions } from './permissions.helper';
 
 @Injectable()
 export class AuthService {
@@ -21,74 +23,12 @@ export class AuthService {
   ) {}
 
   /**
-   * Registra una nueva empresa (Tenant) con su usuario administrador inicial
+   * Registro de nuevas empresas deshabilitado (modo empresa única HelpCopies SRL)
    */
-  async registerTenant(dto: RegisterTenantDto, ipAddress?: string) {
-    // 1. Validar que el slug no esté en uso
-    const existingTenant = await this.prisma.tenant.findUnique({
-      where: { slug: dto.companySlug.toLowerCase().trim() },
-    });
-
-    if (existingTenant) {
-      throw new ConflictException('El identificador (slug) de la empresa ya está en uso');
-    }
-
-    // 2. Hash de contraseña seguro
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(dto.password, salt);
-
-    // 3. Crear Tenant y Usuario Administrador en una transacción atómica
-    const result = await this.prisma.$transaction(async (tx) => {
-      const tenant = await tx.tenant.create({
-        data: {
-          name: dto.companyName,
-          slug: dto.companySlug.toLowerCase().trim(),
-        },
-      });
-
-      const user = await tx.user.create({
-        data: {
-          tenantId: tenant.id,
-          name: dto.adminName,
-          email: dto.email.toLowerCase().trim(),
-          password: hashedPassword,
-          role: Role.ADMIN,
-        },
-      });
-
-      return { tenant, user };
-    });
-
-    // 4. Registro de Auditoría
-    await this.auditService.log({
-      tenantId: result.tenant.id,
-      userId: result.user.id,
-      action: 'TENANT_REGISTERED',
-      entity: 'Tenant',
-      entityId: result.tenant.id,
-      payload: { companyName: result.tenant.name, adminEmail: result.user.email },
-      ipAddress,
-    });
-
-    // 5. Generar Token JWT
-    const token = this.generateToken(result.user);
-
-    return {
-      message: 'Empresa y usuario administrador registrados exitosamente',
-      accessToken: token,
-      user: {
-        id: result.user.id,
-        name: result.user.name,
-        email: result.user.email,
-        role: result.user.role,
-        tenantId: result.tenant.id,
-      },
-      tenant: {
-        id: result.tenant.id,
-        name: result.tenant.name,
-        slug: result.tenant.slug,
-      },
-    };
+  async registerTenant(_dto: RegisterTenantDto, _ipAddress?: string) {
+    throw new ForbiddenException(
+      'El sistema opera en modo empresa única (HelpCopies SRL). No está permitido registrar nuevas empresas.',
+    );
   }
 
   /**
@@ -119,22 +59,15 @@ export class AuthService {
       throw new UnauthorizedException('Credenciales inválidas');
     }
 
-    // Cargar permisos correspondientes al rol
-    const rolePermissions = await this.prisma.rolePermission.findMany({
-      where: { role: user.role },
-      include: {
-        permission: {
-          select: { code: true },
-        },
-      },
-    });
-
-    const permissions = rolePermissions.map((rp) => rp.permission.code);
+    const permissions = await resolveEffectivePermissions(this.prisma, user);
+    const effectiveTenant =
+      user.tenant ?? (user.role === Role.SUPER_ADMIN ? await getPrimaryTenant(this.prisma) : null);
+    const effectiveTenantId = user.tenantId ?? effectiveTenant?.id ?? null;
 
     // Registro de Auditoría
-    if (user.tenantId) {
+    if (effectiveTenantId) {
       await this.auditService.log({
-        tenantId: user.tenantId,
+        tenantId: effectiveTenantId,
         userId: user.id,
         action: 'LOGIN',
         entity: 'User',
@@ -143,7 +76,12 @@ export class AuthService {
       });
     }
 
-    const accessToken = this.generateToken(user);
+    const accessToken = this.generateToken({
+      id: user.id,
+      email: user.email,
+      tenantId: effectiveTenantId,
+      role: user.role,
+    });
 
     return {
       accessToken,
@@ -152,15 +90,16 @@ export class AuthService {
         name: user.name,
         email: user.email,
         role: user.role,
-        tenantId: user.tenantId,
+        tenantId: effectiveTenantId,
       },
-      tenant: user.tenant
+      tenant: effectiveTenant
         ? {
-            id: user.tenant.id,
-            name: user.tenant.name,
-            slug: user.tenant.slug,
-            whatsappStatus: user.tenant.whatsappStatus,
-            whatsappPhone: user.tenant.whatsappPhone,
+            id: effectiveTenant.id,
+            name: effectiveTenant.name,
+            slug: effectiveTenant.slug,
+            whatsappStatus: effectiveTenant.whatsappStatus,
+            whatsappPhone: effectiveTenant.whatsappPhone,
+            aiEnabled: effectiveTenant.aiEnabled,
           }
         : null,
       permissions,
@@ -191,14 +130,10 @@ export class AuthService {
       throw new UnauthorizedException('Usuario no encontrado');
     }
 
-    const rolePermissions = await this.prisma.rolePermission.findMany({
-      where: { role: user.role },
-      include: {
-        permission: {
-          select: { code: true, name: true, category: true },
-        },
-      },
-    });
+    const permissions = await resolveEffectivePermissions(this.prisma, user);
+    const effectiveTenant =
+      user.tenant ?? (user.role === Role.SUPER_ADMIN ? await getPrimaryTenant(this.prisma) : null);
+    const effectiveTenantId = user.tenantId ?? effectiveTenant?.id ?? null;
 
     return {
       user: {
@@ -206,10 +141,10 @@ export class AuthService {
         name: user.name,
         email: user.email,
         role: user.role,
-        tenantId: user.tenantId,
+        tenantId: effectiveTenantId,
       },
-      tenant: user.tenant,
-      permissions: rolePermissions.map((rp) => rp.permission.code),
+      tenant: effectiveTenant,
+      permissions,
     };
   }
 

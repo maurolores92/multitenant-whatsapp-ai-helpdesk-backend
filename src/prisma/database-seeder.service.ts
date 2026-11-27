@@ -7,6 +7,7 @@ import {
   ROLE_DEFAULT_PERMISSIONS,
 } from '../auth/constants/permissions.constant';
 import { DEFAULT_GEMINI_MODEL } from '../ai/ai-prompt.helper';
+import { ensureDefaultTechnicalAgent } from '../agents/agents.helper';
 
 @Injectable()
 export class DatabaseSeederService implements OnApplicationBootstrap {
@@ -138,6 +139,8 @@ export class DatabaseSeederService implements OnApplicationBootstrap {
             name: 'HelpCopies SRL',
             slug: defaultSlug,
             whatsappPhone: '+54 9 11 5555-0199',
+            isSystem: true,
+            isActive: true,
           },
         });
         this.logger.log(`✔ Empresa actualizada a: ${tenant.name} (${tenant.slug})`);
@@ -148,10 +151,17 @@ export class DatabaseSeederService implements OnApplicationBootstrap {
             slug: defaultSlug,
             whatsappPhone: '+54 9 11 5555-0199',
             aiEnabled: true,
+            isSystem: true,
+            isActive: true,
           },
         });
         this.logger.log(`✔ Empresa creada: ${tenant.name}`);
       }
+    } else if (!tenant.isSystem || !tenant.isActive) {
+      tenant = await this.prisma.tenant.update({
+        where: { id: tenant.id },
+        data: { isSystem: true, isActive: true },
+      });
     }
 
     // 3. Crear Usuario Admin de Compañía (HelpCopies SRL) solo si la compañía no tiene ningún ADMIN
@@ -193,7 +203,7 @@ export class DatabaseSeederService implements OnApplicationBootstrap {
       }
     }
 
-    // Migrar modelos Gemini retirados en tenants existentes hacia el modelo vigente
+    // Migrar modelos Gemini retirados en tenants y agentes existentes hacia el modelo vigente
     await this.prisma.tenant.updateMany({
       where: {
         geminiModel: {
@@ -204,6 +214,22 @@ export class DatabaseSeederService implements OnApplicationBootstrap {
         geminiModel: DEFAULT_GEMINI_MODEL,
       },
     });
+
+    // Asegurar agente principal de Servicio Técnico y migrar datos históricos
+    const technicalAgent = await ensureDefaultTechnicalAgent(this.prisma, tenant.id);
+    if (technicalAgent) {
+      await this.prisma.whatsAppAgent.updateMany({
+        where: {
+          geminiModel: {
+            in: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
+          },
+        },
+        data: {
+          geminiModel: DEFAULT_GEMINI_MODEL,
+        },
+      });
+      this.logger.log(`✔ Agente principal verificado: ${technicalAgent.name} (${technicalAgent.code})`);
+    }
 
     this.logger.log('✔ Usuarios base (Superadmin y Admin de compañía) verificados.');
   }

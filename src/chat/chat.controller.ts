@@ -16,7 +16,7 @@ import { RequirePermissions } from '../auth/decorators/require-permissions.decor
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { CurrentTenant } from '../auth/decorators/current-tenant.decorator';
 import { PERMISSIONS } from '../auth/constants/permissions.constant';
-import { ConversationStatus } from '@prisma/client';
+import { AgentArea, ConversationStatus } from '@prisma/client';
 
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 @Controller('chat')
@@ -24,15 +24,17 @@ export class ChatController {
   constructor(private readonly chatService: ChatService) {}
 
   /**
-   * Obtener todas las conversaciones de la empresa con filtros opcionales por estado
+   * Obtener todas las conversaciones de la empresa con filtros opcionales por estado, área o agente
    */
   @RequirePermissions(PERMISSIONS.READ_CHATS)
   @Get('conversations')
   async getConversations(
     @CurrentTenant() tenantId: string,
     @Query('status') status?: ConversationStatus,
+    @Query('area') area?: AgentArea,
+    @Query('agentId') agentId?: string,
   ) {
-    return this.chatService.getConversations(tenantId, status);
+    return this.chatService.getConversations(tenantId, status, { area, agentId });
   }
 
   /**

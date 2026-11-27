@@ -3,6 +3,8 @@ import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
+import { Role } from '@prisma/client';
+import { getPrimaryTenant, resolveEffectivePermissions } from '../permissions.helper';
 
 export interface JwtPayload {
   sub: string;
@@ -43,25 +45,17 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('Usuario o empresa inactiva/no autorizada');
     }
 
-    // Cargar permisos correspondientes al rol del usuario
-    const rolePermissions = await this.prisma.rolePermission.findMany({
-      where: { role: user.role },
-      include: {
-        permission: {
-          select: { code: true },
-        },
-      },
-    });
-
-    const permissions = rolePermissions.map((rp) => rp.permission.code);
+    const permissions = await resolveEffectivePermissions(this.prisma, user);
+    const effectiveTenant =
+      user.tenant ?? (user.role === Role.SUPER_ADMIN ? await getPrimaryTenant(this.prisma) : null);
 
     return {
       id: user.id,
       name: user.name,
       email: user.email,
       role: user.role,
-      tenantId: user.tenantId,
-      tenant: user.tenant,
+      tenantId: user.tenantId ?? effectiveTenant?.id ?? null,
+      tenant: effectiveTenant,
       permissions,
     };
   }

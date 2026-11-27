@@ -1,6 +1,10 @@
 import { Role } from '@prisma/client';
 
 export const PERMISSIONS = {
+  // Módulo Servicio Técnico
+  ACCESS_TECHNICAL_SERVICE: 'ACCESS_TECHNICAL_SERVICE',
+  MANAGE_TECHNICAL_AI: 'MANAGE_TECHNICAL_AI',
+
   // Conversaciones y Chat WhatsApp
   READ_CHATS: 'READ_CHATS',
   SEND_CHAT_MESSAGE: 'SEND_CHAT_MESSAGE',
@@ -25,15 +29,27 @@ export type PermissionCode = (typeof PERMISSIONS)[keyof typeof PERMISSIONS];
 
 export const PERMISSION_DEFINITIONS = [
   {
+    code: PERMISSIONS.ACCESS_TECHNICAL_SERVICE,
+    name: 'Acceso a Servicio Técnico',
+    description: 'Habilita el módulo de Servicio Técnico (Chats de IA y Tickets)',
+    category: 'technical_service',
+  },
+  {
+    code: PERMISSIONS.MANAGE_TECHNICAL_AI,
+    name: 'Configurar y Entrenar IA Técnica',
+    description: 'Permite editar prompts, reglas, base de conocimiento y simular el agente de Servicio Técnico',
+    category: 'technical_service',
+  },
+  {
     code: PERMISSIONS.READ_CHATS,
-    name: 'Ver Conversaciones',
-    description: 'Permite leer los mensajes y chats de WhatsApp de la empresa',
+    name: 'Ver Chats de IA',
+    description: 'Permite leer los mensajes y conversaciones de WhatsApp e IA',
     category: 'chat',
   },
   {
     code: PERMISSIONS.SEND_CHAT_MESSAGE,
-    name: 'Enviar Mensajes de WhatsApp',
-    description: 'Permite responder a clientes desde la línea corporativa',
+    name: 'Responder Chats de WhatsApp',
+    description: 'Permite responder manualmente a clientes desde la línea corporativa',
     category: 'chat',
   },
   {
@@ -51,7 +67,7 @@ export const PERMISSION_DEFINITIONS = [
   {
     code: PERMISSIONS.VIEW_EQUIPMENT,
     name: 'Ver Equipos de Clientes',
-    description: 'Permite consultar fichas y números de serie de equipos',
+    description: 'Permite consultar fichas y códigos de máquinas',
     category: 'equipments',
   },
   {
@@ -62,26 +78,26 @@ export const PERMISSION_DEFINITIONS = [
   },
   {
     code: PERMISSIONS.CREATE_TICKET,
-    name: 'Crear Órdenes de Servicio',
+    name: 'Crear Tickets / Órdenes',
     description: 'Permite abrir tickets de asistencia remota o física',
     category: 'tickets',
   },
   {
     code: PERMISSIONS.UPDATE_TICKET,
     name: 'Actualizar Tickets',
-    description: 'Permite cambiar estados, resoluciones y técnicos asignados',
+    description: 'Permite cambiar estados, resoluciones y asociar órdenes de servicio',
     category: 'tickets',
   },
   {
     code: PERMISSIONS.MANAGE_WHATSAPP_CONFIG,
-    name: 'Configurar WhatsApp',
-    description: 'Permite conectar/desconectar el código QR y ajustar prompts de IA',
+    name: 'Configurar WhatsApp y Empresa',
+    description: 'Permite configurar credenciales de Meta Cloud API y sincronización ERP',
     category: 'admin',
   },
   {
     code: PERMISSIONS.MANAGE_USERS_ROLES,
-    name: 'Administrar Usuarios y Roles',
-    description: 'Permite invitar nuevos técnicos, agentes y asignar roles',
+    name: 'Administrar Usuarios y Permisos',
+    description: 'Permite dar de alta usuarios y asignar permisos por módulo',
     category: 'admin',
   },
   {
@@ -92,20 +108,25 @@ export const PERMISSION_DEFINITIONS = [
   },
 ];
 
+export const TECHNICAL_SERVICE_BUNDLE: PermissionCode[] = [
+  PERMISSIONS.ACCESS_TECHNICAL_SERVICE,
+  PERMISSIONS.MANAGE_TECHNICAL_AI,
+  PERMISSIONS.READ_CHATS,
+  PERMISSIONS.SEND_CHAT_MESSAGE,
+  PERMISSIONS.ASSIGN_CONVERSATION,
+  PERMISSIONS.RESOLVE_CONVERSATION,
+  PERMISSIONS.VIEW_EQUIPMENT,
+  PERMISSIONS.MANAGE_EQUIPMENT,
+  PERMISSIONS.CREATE_TICKET,
+  PERMISSIONS.UPDATE_TICKET,
+];
+
 export const ROLE_DEFAULT_PERMISSIONS: Record<Role, PermissionCode[]> = {
   SUPER_ADMIN: Object.values(PERMISSIONS),
   ADMIN: Object.values(PERMISSIONS),
-  TECHNICIAN: [
-    PERMISSIONS.READ_CHATS,
-    PERMISSIONS.SEND_CHAT_MESSAGE,
-    PERMISSIONS.ASSIGN_CONVERSATION,
-    PERMISSIONS.RESOLVE_CONVERSATION,
-    PERMISSIONS.VIEW_EQUIPMENT,
-    PERMISSIONS.MANAGE_EQUIPMENT,
-    PERMISSIONS.CREATE_TICKET,
-    PERMISSIONS.UPDATE_TICKET,
-  ],
+  TECHNICIAN: [...TECHNICAL_SERVICE_BUNDLE],
   AGENT: [
+    PERMISSIONS.ACCESS_TECHNICAL_SERVICE,
     PERMISSIONS.READ_CHATS,
     PERMISSIONS.SEND_CHAT_MESSAGE,
     PERMISSIONS.RESOLVE_CONVERSATION,

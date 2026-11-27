@@ -21,29 +21,43 @@ export class MetaCloudApiService implements IWhatsAppProvider {
   }
 
   /**
-   * Envía un mensaje de texto oficial vía Meta Cloud API
+   * Envía un mensaje de texto oficial vía Meta Cloud API usando las credenciales del agente o empresa
    */
   async sendTextMessage(params: {
     tenantId: string;
+    agentId?: string;
     to: string;
     text: string;
   }): Promise<SendMessageResult> {
-    const { tenantId, to, text } = params;
+    const { tenantId, agentId, to, text } = params;
 
-    // 1. Obtener credenciales de la empresa
-    const tenant = await this.prisma.tenant.findUnique({
-      where: { id: tenantId },
-      select: {
-        whatsappPhoneNumberId: true,
-        whatsappAccessToken: true,
-      },
-    });
+    // 1. Obtener credenciales priorizando el WhatsAppAgent específico
+    const [agent, tenant] = await Promise.all([
+      agentId
+        ? this.prisma.whatsAppAgent.findFirst({
+            where: { id: agentId, tenantId },
+            select: {
+              whatsappPhoneNumberId: true,
+              whatsappAccessToken: true,
+            },
+          })
+        : Promise.resolve(null),
+      this.prisma.tenant.findUnique({
+        where: { id: tenantId },
+        select: {
+          whatsappPhoneNumberId: true,
+          whatsappAccessToken: true,
+        },
+      }),
+    ]);
 
     const phoneNumberId =
+      agent?.whatsappPhoneNumberId ||
       tenant?.whatsappPhoneNumberId ||
       this.configService.get<string>('META_DEFAULT_PHONE_NUMBER_ID');
 
     const accessToken =
+      agent?.whatsappAccessToken ||
       tenant?.whatsappAccessToken ||
       this.configService.get<string>('META_DEFAULT_ACCESS_TOKEN');
 

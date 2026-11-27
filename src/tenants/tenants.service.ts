@@ -3,6 +3,7 @@ import {
   ConflictException,
   NotFoundException,
   BadRequestException,
+  ForbiddenException,
   Logger,
 } from '@nestjs/common';
 import * as bcrypt from 'bcryptjs';
@@ -13,6 +14,8 @@ import { CreateTenantUserDto } from './dto/create-tenant-user.dto';
 import { UpdateTenantUserDto } from './dto/update-tenant-user.dto';
 import { UpdateWhatsAppConfigDto } from './dto/update-whatsapp-config.dto';
 import { Role, WhatsAppStatus } from '@prisma/client';
+import { resolveEffectivePermissions, syncUserPermissions } from '../auth/permissions.helper';
+import { ensureDefaultTechnicalAgent } from '../agents/agents.helper';
 
 @Injectable()
 export class TenantsService {
@@ -24,11 +27,11 @@ export class TenantsService {
   ) {}
 
   /**
-   * Obtiene la lista completa de compañías (Exclusivo Superadmin)
+   * Obtiene la lista de la empresa única del sistema
    */
   async findAll() {
-    return this.prisma.tenant.findMany({
-      orderBy: { createdAt: 'desc' },
+    const tenants = await this.prisma.tenant.findMany({
+      orderBy: { createdAt: 'asc' },
       include: {
         _count: {
           select: {
@@ -45,10 +48,23 @@ export class TenantsService {
             email: true,
             role: true,
             isActive: true,
+            useCustomPermissions: true,
           },
         },
       },
     });
+
+    return Promise.all(
+      tenants.map(async (tenant) => ({
+        ...tenant,
+        users: await Promise.all(
+          tenant.users.map(async (u) => ({
+            ...u,
+            permissions: await resolveEffectivePermissions(this.prisma, u),
+          })),
+        ),
+      })),
+    );
   }
 
   /**
@@ -73,6 +89,7 @@ export class TenantsService {
             email: true,
             role: true,
             isActive: true,
+            useCustomPermissions: true,
             createdAt: true,
           },
         },
@@ -83,77 +100,46 @@ export class TenantsService {
       throw new NotFoundException('Compañía no encontrada');
     }
 
-    return tenant;
+    return {
+      ...tenant,
+      users: await Promise.all(
+        tenant.users.map(async (u) => ({
+          ...u,
+          permissions: await resolveEffectivePermissions(this.prisma, u),
+        })),
+      ),
+    };
   }
 
   /**
-   * Crea una nueva compañía y su usuario Administrador inicial
+   * Bloquea la creación manual de nuevas compañías en modo mono-empresa
    */
-  async create(dto: CreateTenantDto, currentUserId?: string) {
-    const slug = dto.slug.toLowerCase().trim();
-    const adminEmail = dto.adminEmail.toLowerCase().trim();
+  async create(_dto: CreateTenantDto, _currentUserId?: string) {
+    throw new ForbiddenException(
+      'El sistema opera en modo empresa única (HelpCopies SRL). No se pueden crear empresas manualmente.',
+    );
+  }
 
-    // 1. Validar slug único
-    const existingTenant = await this.prisma.tenant.findUnique({
-      where: { slug },
+  /**
+   * Protege la empresa sembrada del sistema contra eliminación
+   */
+  async remove(id: string) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id },
+      select: { id: true, name: true, slug: true, isSystem: true },
     });
-    if (existingTenant) {
-      throw new ConflictException(`El slug '${slug}' ya está en uso`);
+
+    if (!tenant) {
+      throw new NotFoundException('Compañía no encontrada');
     }
 
-    // 2. Validar email único de administrador
-    const existingUser = await this.prisma.user.findUnique({
-      where: { email: adminEmail },
-    });
-    if (existingUser) {
-      throw new ConflictException(`El correo '${adminEmail}' ya está registrado en el sistema`);
+    if (tenant.isSystem || tenant.slug === 'helpcopies') {
+      throw new ForbiddenException(
+        `La empresa principal '${tenant.name}' está protegida por el sistema y nunca puede eliminarse.`,
+      );
     }
 
-    // 3. Hash seguro de la contraseña
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(dto.adminPassword, salt);
-
-    // 4. Crear Tenant y Usuario Administrador en una sola transacción
-    const result = await this.prisma.$transaction(async (tx) => {
-      const tenant = await tx.tenant.create({
-        data: {
-          name: dto.name,
-          slug,
-          whatsappPhone: dto.whatsappPhone || null,
-          whatsappPhoneNumberId: dto.whatsappPhoneNumberId || null,
-          whatsappAccessToken: dto.whatsappAccessToken || null,
-        },
-      });
-
-      const adminUser = await tx.user.create({
-        data: {
-          tenantId: tenant.id,
-          name: dto.adminName,
-          email: adminEmail,
-          password: hashedPassword,
-          role: Role.ADMIN,
-        },
-      });
-
-      return { tenant, adminUser };
-    });
-
-    // 5. Registro de Auditoría
-    await this.auditService.log({
-      tenantId: result.tenant.id,
-      userId: currentUserId,
-      action: 'TENANT_CREATED',
-      entity: 'Tenant',
-      entityId: result.tenant.id,
-      payload: {
-        tenantName: result.tenant.name,
-        adminEmail: result.adminUser.email,
-      },
-    });
-
-    this.logger.log(`✔ Compañía creada: ${result.tenant.name} con Admin ${result.adminUser.email}`);
-
-    return result;
+    throw new ForbiddenException('La eliminación de empresas está deshabilitada en este entorno.');
   }
 
   /**
@@ -194,8 +180,21 @@ export class TenantsService {
         email: true,
         role: true,
         isActive: true,
+        useCustomPermissions: true,
         createdAt: true,
       },
+    });
+
+    if (Array.isArray(dto.permissions) && newUser.role !== Role.SUPER_ADMIN) {
+      await syncUserPermissions(this.prisma, newUser.id, dto.permissions);
+    }
+
+    const effectivePermissions = await resolveEffectivePermissions(this.prisma, {
+      ...newUser,
+      useCustomPermissions:
+        Array.isArray(dto.permissions) && newUser.role !== Role.SUPER_ADMIN
+          ? true
+          : newUser.useCustomPermissions,
     });
 
     await this.auditService.log({
@@ -204,12 +203,20 @@ export class TenantsService {
       action: 'USER_CREATED',
       entity: 'User',
       entityId: newUser.id,
-      payload: { userName: newUser.name, userEmail: newUser.email, role: newUser.role },
+      payload: {
+        userName: newUser.name,
+        userEmail: newUser.email,
+        role: newUser.role,
+        permissions: effectivePermissions,
+      },
     });
 
     this.logger.log(`✔ Usuario ${newUser.name} (${newUser.role}) agregado a la compañía ${tenant.name}`);
 
-    return newUser;
+    return {
+      ...newUser,
+      permissions: effectivePermissions,
+    };
   }
 
   /**
@@ -236,6 +243,20 @@ export class TenantsService {
         whatsappStatus: isConnected ? WhatsAppStatus.CONNECTED : WhatsAppStatus.DISCONNECTED,
       },
     });
+
+    const defaultAgent = await ensureDefaultTechnicalAgent(this.prisma, tenantId);
+    if (defaultAgent) {
+      await this.prisma.whatsAppAgent.update({
+        where: { id: defaultAgent.id },
+        data: {
+          whatsappPhoneNumberId: updated.whatsappPhoneNumberId,
+          whatsappWabaId: updated.whatsappWabaId,
+          whatsappAccessToken: updated.whatsappAccessToken,
+          whatsappPhone: updated.whatsappPhone,
+          whatsappStatus: updated.whatsappStatus,
+        },
+      });
+    }
 
     await this.auditService.log({
       tenantId,
@@ -320,8 +341,20 @@ export class TenantsService {
         email: true,
         role: true,
         isActive: true,
+        useCustomPermissions: true,
         createdAt: true,
       },
+    });
+
+    let useCustom = updatedUser.useCustomPermissions;
+    if (Array.isArray(dto.permissions) && updatedUser.role !== Role.SUPER_ADMIN) {
+      await syncUserPermissions(this.prisma, updatedUser.id, dto.permissions);
+      useCustom = true;
+    }
+
+    const effectivePermissions = await resolveEffectivePermissions(this.prisma, {
+      ...updatedUser,
+      useCustomPermissions: useCustom,
     });
 
     await this.auditService.log({
@@ -336,12 +369,17 @@ export class TenantsService {
         userEmail: updatedUser.email,
         role: updatedUser.role,
         isActive: updatedUser.isActive,
+        permissions: effectivePermissions,
       },
     });
 
     this.logger.log(`✔ Usuario ${updatedUser.name} (${updatedUser.email}) actualizado en compañía ID ${tenantId}`);
 
-    return updatedUser;
+    return {
+      ...updatedUser,
+      useCustomPermissions: useCustom,
+      permissions: effectivePermissions,
+    };
   }
 
   /**

@@ -23,13 +23,13 @@ import { TicketStatus, ServiceType, TicketReason, TicketSource } from '@prisma/c
 export class TicketsController {
   constructor(private readonly ticketsService: TicketsService) {}
 
-  @RequirePermissions(PERMISSIONS.READ_CHATS)
+  @RequirePermissions(PERMISSIONS.ACCESS_TECHNICAL_SERVICE)
   @Get('catalogs')
   async getCatalogs(@CurrentTenant() tenantId: string) {
     return this.ticketsService.getCatalogs(tenantId);
   }
 
-  @RequirePermissions(PERMISSIONS.READ_CHATS)
+  @RequirePermissions(PERMISSIONS.ACCESS_TECHNICAL_SERVICE)
   @Get()
   async getTickets(
     @CurrentTenant() tenantId: string,
@@ -49,7 +49,7 @@ export class TicketsController {
     });
   }
 
-  @RequirePermissions(PERMISSIONS.READ_CHATS)
+  @RequirePermissions(PERMISSIONS.ACCESS_TECHNICAL_SERVICE)
   @Get(':id')
   async getTicketById(
     @CurrentTenant() tenantId: string,

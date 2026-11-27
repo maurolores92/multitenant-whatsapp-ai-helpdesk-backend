@@ -97,6 +97,12 @@ enum ErpAuthType {
   LOGIN_CREDENTIALS
 }
 
+enum AgentArea {
+  TECHNICAL_SERVICE
+  ACCOUNTING
+  GENERAL
+}
+
 // ----------------------------------------------------
 // MULTITENANCY & USERS
 // ----------------------------------------------------
@@ -106,6 +112,7 @@ model Tenant {
   name              String
   slug              String          @unique
   isActive          Boolean         @default(true)
+  isSystem          Boolean         @default(false) // Empresa principal protegida (no eliminable)
   
   // WhatsApp Cloud API (Meta Oficial) Configuration
   whatsappPhoneNumberId String?         @unique // ID del número de teléfono en Meta Cloud API
@@ -141,8 +148,48 @@ model Tenant {
   aiTrainingExamples AiTrainingExample[]
   erpIntegration    ErpIntegration?
   problemTypes      ProblemType[]
+  whatsappAgents    WhatsAppAgent[]
 
   @@map("tenants")
+}
+
+model WhatsAppAgent {
+  id                    String          @id @default(uuid())
+  tenantId              String
+  tenant                Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  code                  String          // ej: "technical-service", "accounting"
+  name                  String          // ej: "Agente Servicio Técnico"
+  area                  AgentArea       @default(TECHNICAL_SERVICE)
+  isActive              Boolean         @default(true)
+  isDefault             Boolean         @default(false)
+
+  // Credenciales Meta WhatsApp Cloud API de este teléfono/agente
+  whatsappPhoneNumberId String?         @unique
+  whatsappWabaId        String?
+  whatsappAccessToken   String?         @db.Text
+  whatsappPhone         String?
+  whatsappStatus        WhatsAppStatus  @default(DISCONNECTED)
+
+  // Configuración del agente IA propio de este teléfono
+  geminiApiKey          String?         @db.Text
+  geminiModel           String          @default("gemini-3.8-flash")
+  aiTemperature         Float           @default(0.2)
+  aiSystemPrompt        String?         @db.Text
+  aiEnabled             Boolean         @default(true)
+
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
+
+  conversations         Conversation[]
+  tickets               Ticket[]
+  aiRules               AiRule[]
+  aiKnowledgeItems      AiKnowledgeItem[]
+  aiTrainingExamples    AiTrainingExample[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId, area, isActive])
+  @@map("whatsapp_agents")
 }
 
 model User {
@@ -155,6 +202,7 @@ model User {
   password              String
   role                  Role           @default(AGENT)
   isActive              Boolean        @default(true)
+  useCustomPermissions  Boolean        @default(false)
   
   createdAt             DateTime       @default(now())
   updatedAt             DateTime       @updatedAt
@@ -165,6 +213,7 @@ model User {
   assignedTickets       Ticket[]       @relation("TechnicianAssignedTickets")
   auditLogs             AuditLog[]
   notifications         Notification[]
+  userPermissions       UserPermission[]
 
   @@index([tenantId, email])
   @@map("users")
@@ -179,10 +228,11 @@ model Permission {
   code        String           @unique // ej: "READ_CHATS", "SEND_CHAT_MESSAGE"
   name        String
   description String?
-  category    String           // "chat", "tickets", "equipments", "admin"
+  category    String           // "chat", "tickets", "equipments", "admin", "technical_service"
   createdAt   DateTime         @default(now())
 
   roles       RolePermission[]
+  users       UserPermission[]
 
   @@map("permissions")
 }
@@ -194,6 +244,16 @@ model RolePermission {
 
   @@id([role, permissionId])
   @@map("role_permissions")
+}
+
+model UserPermission {
+  userId       String
+  permissionId String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([userId, permissionId])
+  @@map("user_permissions")
 }
 
 // ----------------------------------------------------
@@ -314,6 +374,9 @@ model Conversation {
   id              String             @id @default(uuid())
   tenantId        String
   tenant          Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  agentId         String?
+  agent           WhatsAppAgent?     @relation(fields: [agentId], references: [id], onDelete: SetNull)
   
   customerId      String
   customer        Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade)
@@ -336,6 +399,7 @@ model Conversation {
 
   @@index([tenantId, status])
   @@index([tenantId, customerId])
+  @@index([tenantId, agentId, status])
   @@map("conversations")
 }
 
@@ -373,6 +437,9 @@ model Ticket {
   id                   String         @id @default(uuid())
   tenantId             String
   tenant               Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  agentId              String?
+  agent                WhatsAppAgent? @relation(fields: [agentId], references: [id], onDelete: SetNull)
   
   customerId           String
   customer             Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
@@ -418,6 +485,8 @@ model AiRule {
   id          String         @id @default(uuid())
   tenantId    String
   tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agentId     String?
+  agent       WhatsAppAgent? @relation(fields: [agentId], references: [id], onDelete: Cascade)
   title       String
   instruction String         @db.Text
   category    AiRuleCategory @default(BUSINESS)
@@ -427,36 +496,43 @@ model AiRule {
   updatedAt   DateTime       @updatedAt
 
   @@index([tenantId, isActive])
+  @@index([agentId, isActive])
   @@map("ai_rules")
 }
 
 model AiKnowledgeItem {
-  id          String   @id @default(uuid())
+  id          String         @id @default(uuid())
   tenantId    String
-  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  question    String   @db.Text
-  answer      String   @db.Text
+  tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agentId     String?
+  agent       WhatsAppAgent? @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  question    String         @db.Text
+  answer      String         @db.Text
   tags        String[]
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  isActive    Boolean        @default(true)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
 
   @@index([tenantId, isActive])
+  @@index([agentId, isActive])
   @@map("ai_knowledge_items")
 }
 
 model AiTrainingExample {
-  id            String   @id @default(uuid())
+  id            String         @id @default(uuid())
   tenantId      String
-  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  customerInput String   @db.Text
-  idealResponse String   @db.Text
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agentId       String?
+  agent         WhatsAppAgent? @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  customerInput String         @db.Text
+  idealResponse String         @db.Text
   topic         String?
-  isApproved    Boolean  @default(true)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  isApproved    Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
 
   @@index([tenantId, isApproved])
+  @@index([agentId, isApproved])
   @@map("ai_training_examples")
 }
 

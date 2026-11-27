@@ -11,6 +11,7 @@ import { UpdateAiConfigDto } from './dto/update-ai-config.dto';
 import { CreateAiRuleDto, UpdateAiRuleDto } from './dto/ai-rule.dto';
 import { CreateAiKnowledgeDto, UpdateAiKnowledgeDto } from './dto/ai-knowledge.dto';
 import { CreateAiExampleDto } from './dto/ai-example.dto';
+import { AgentArea } from '@prisma/client';
 import {
   buildCustomerConversationContext,
   buildTenantAiSystemInstructions,
@@ -19,6 +20,12 @@ import {
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
 } from '../ai/ai-prompt.helper';
+import { resolveTenantAgent } from '../agents/agents.helper';
+
+export interface AgentScopeOptions {
+  agentId?: string;
+  area?: AgentArea;
+}
 
 @Injectable()
 export class AiTrainingService {
@@ -31,66 +38,80 @@ export class AiTrainingService {
   ) {}
 
   /**
-   * Obtiene la configuración de IA de una compañía (sin exponer el API Key completo)
+   * Obtiene la configuración de IA de un agente (o del agente principal de la compañía)
    */
-  async getAiConfig(tenantId: string) {
+  async getAiConfig(tenantId: string, scope?: AgentScopeOptions) {
     const tenant = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
-      select: {
-        id: true,
-        name: true,
-        geminiApiKey: true,
-        geminiModel: true,
-        aiTemperature: true,
-        aiSystemPrompt: true,
-        aiEnabled: true,
-        _count: {
-          select: {
-            aiRules: true,
-            aiKnowledgeItems: true,
-            aiTrainingExamples: true,
-          },
-        },
-      },
+      select: { id: true, name: true, geminiApiKey: true, geminiModel: true, aiTemperature: true, aiSystemPrompt: true, aiEnabled: true },
     });
 
     if (!tenant) {
       throw new NotFoundException('Compañía no encontrada');
     }
 
-    const hasCustomApiKey = Boolean(tenant.geminiApiKey?.trim());
+    const agent = await resolveTenantAgent(this.prisma, tenantId, scope);
+    if (!agent) {
+      throw new NotFoundException('Agente de WhatsApp no encontrado');
+    }
+
+    const [rulesCount, kbCount, examplesCount] = await Promise.all([
+      this.prisma.aiRule.count({ where: { tenantId, agentId: agent.id } }),
+      this.prisma.aiKnowledgeItem.count({ where: { tenantId, agentId: agent.id } }),
+      this.prisma.aiTrainingExample.count({ where: { tenantId, agentId: agent.id } }),
+    ]);
+
+    const effectiveKey = agent.geminiApiKey ?? tenant.geminiApiKey;
+    const hasCustomApiKey = Boolean(effectiveKey?.trim());
     let maskedApiKey: string | null = null;
-    if (hasCustomApiKey && tenant.geminiApiKey) {
-      const key = tenant.geminiApiKey.trim();
+    if (hasCustomApiKey && effectiveKey) {
+      const key = effectiveKey.trim();
       maskedApiKey = key.length > 8 ? `${key.substring(0, 4)}...${key.substring(key.length - 4)}` : '••••••••';
     }
 
     return {
       tenantId: tenant.id,
       tenantName: tenant.name,
+      agentId: agent.id,
+      agentName: agent.name,
+      agentArea: agent.area,
       geminiModel: resolveGeminiModel(
-        tenant.geminiModel,
+        agent.geminiModel || tenant.geminiModel,
         this.configService.get<string>('GEMINI_MODEL'),
       ),
-      aiTemperature: tenant.aiTemperature,
-      aiSystemPrompt: tenant.aiSystemPrompt,
-      aiEnabled: tenant.aiEnabled,
+      aiTemperature: agent.aiTemperature ?? tenant.aiTemperature,
+      aiSystemPrompt: agent.aiSystemPrompt ?? tenant.aiSystemPrompt,
+      aiEnabled: agent.aiEnabled,
       hasCustomApiKey,
       maskedApiKey,
-      counts: tenant._count,
+      counts: {
+        aiRules: rulesCount,
+        aiKnowledgeItems: kbCount,
+        aiTrainingExamples: examplesCount,
+      },
     };
   }
 
   /**
-   * Actualiza la configuración de IA y API Key de Gemini de una compañía (Exclusivo Superadmin)
+   * Actualiza la configuración de IA y API Key de Gemini de un agente
    */
-  async updateAiConfig(tenantId: string, dto: UpdateAiConfigDto, currentUserId?: string) {
+  async updateAiConfig(
+    tenantId: string,
+    dto: UpdateAiConfigDto,
+    currentUserId?: string,
+    scope?: AgentScopeOptions,
+  ) {
     const tenant = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
     });
 
     if (!tenant) {
       throw new NotFoundException('Compañía no encontrada');
+    }
+
+    const agent = await resolveTenantAgent(this.prisma, tenantId, scope);
+    if (!agent) {
+      throw new NotFoundException('Agente de WhatsApp no encontrado');
     }
 
     const updateData: any = {};
@@ -110,18 +131,26 @@ export class AiTrainingService {
       updateData.aiEnabled = dto.aiEnabled;
     }
 
-    const updated = await this.prisma.tenant.update({
-      where: { id: tenantId },
+    const updated = await this.prisma.whatsAppAgent.update({
+      where: { id: agent.id },
       data: updateData,
     });
+
+    if (updated.isDefault) {
+      await this.prisma.tenant.update({
+        where: { id: tenantId },
+        data: updateData,
+      });
+    }
 
     await this.auditService.log({
       tenantId,
       userId: currentUserId,
-      action: 'TENANT_AI_CONFIG_UPDATED',
-      entity: 'Tenant',
-      entityId: tenantId,
+      action: 'AGENT_AI_CONFIG_UPDATED',
+      entity: 'WhatsAppAgent',
+      entityId: updated.id,
       payload: {
+        agentName: updated.name,
         updatedFields: Object.keys(updateData),
         hasCustomApiKey: Boolean(updated.geminiApiKey),
         model: updated.geminiModel,
@@ -129,26 +158,34 @@ export class AiTrainingService {
       },
     });
 
-    this.logger.log(`✔ Configuración de IA actualizada para tenant '${tenant.name}'`);
+    this.logger.log(`✔ Configuración de IA actualizada para agente '${updated.name}'`);
 
-    return this.getAiConfig(tenantId);
+    return this.getAiConfig(tenantId, { agentId: updated.id });
   }
 
   // ========================================================
   // REGLAS MODULARES DE LA IA (AI RULES)
   // ========================================================
 
-  async getRules(tenantId: string) {
+  async getRules(tenantId: string, scope?: AgentScopeOptions) {
+    const agent = await resolveTenantAgent(this.prisma, tenantId, scope);
     return this.prisma.aiRule.findMany({
-      where: { tenantId },
+      where: { tenantId, ...(agent ? { agentId: agent.id } : {}) },
       orderBy: [{ priority: 'asc' }, { createdAt: 'desc' }],
     });
   }
 
-  async createRule(tenantId: string, dto: CreateAiRuleDto, currentUserId?: string) {
+  async createRule(
+    tenantId: string,
+    dto: CreateAiRuleDto,
+    currentUserId?: string,
+    scope?: AgentScopeOptions,
+  ) {
+    const agent = await resolveTenantAgent(this.prisma, tenantId, scope);
     const rule = await this.prisma.aiRule.create({
       data: {
         tenantId,
+        agentId: agent?.id ?? null,
         title: dto.title.trim(),
         instruction: dto.instruction.trim(),
         category: dto.category,
@@ -226,17 +263,25 @@ export class AiTrainingService {
   // BASE DE CONOCIMIENTOS / FAQS (AI KNOWLEDGE)
   // ========================================================
 
-  async getKnowledgeItems(tenantId: string) {
+  async getKnowledgeItems(tenantId: string, scope?: AgentScopeOptions) {
+    const agent = await resolveTenantAgent(this.prisma, tenantId, scope);
     return this.prisma.aiKnowledgeItem.findMany({
-      where: { tenantId },
+      where: { tenantId, ...(agent ? { agentId: agent.id } : {}) },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  async createKnowledgeItem(tenantId: string, dto: CreateAiKnowledgeDto, currentUserId?: string) {
+  async createKnowledgeItem(
+    tenantId: string,
+    dto: CreateAiKnowledgeDto,
+    currentUserId?: string,
+    scope?: AgentScopeOptions,
+  ) {
+    const agent = await resolveTenantAgent(this.prisma, tenantId, scope);
     const item = await this.prisma.aiKnowledgeItem.create({
       data: {
         tenantId,
+        agentId: agent?.id ?? null,
         question: dto.question.trim(),
         answer: dto.answer.trim(),
         tags: dto.tags || [],
@@ -312,17 +357,25 @@ export class AiTrainingService {
   // EJEMPLOS DE ENTRENAMIENTO (FEW-SHOT LEARNING)
   // ========================================================
 
-  async getExamples(tenantId: string) {
+  async getExamples(tenantId: string, scope?: AgentScopeOptions) {
+    const agent = await resolveTenantAgent(this.prisma, tenantId, scope);
     return this.prisma.aiTrainingExample.findMany({
-      where: { tenantId },
+      where: { tenantId, ...(agent ? { agentId: agent.id } : {}) },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  async createExample(tenantId: string, dto: CreateAiExampleDto, currentUserId?: string) {
+  async createExample(
+    tenantId: string,
+    dto: CreateAiExampleDto,
+    currentUserId?: string,
+    scope?: AgentScopeOptions,
+  ) {
+    const agent = await resolveTenantAgent(this.prisma, tenantId, scope);
     const example = await this.prisma.aiTrainingExample.create({
       data: {
         tenantId,
+        agentId: agent?.id ?? null,
         customerInput: dto.customerInput.trim(),
         idealResponse: dto.idealResponse.trim(),
         topic: dto.topic?.trim() || null,
@@ -368,25 +421,14 @@ export class AiTrainingService {
   // ========================================================
 
   /**
-   * Ejecuta una simulación con el motor de Google Gemini inyectando las reglas activas de la empresa
+   * Ejecuta una simulación con el motor de Google Gemini inyectando las reglas activas del agente
    */
-  async simulate(tenantId: string, message: string) {
+  async simulate(tenantId: string, message: string, scope?: AgentScopeOptions) {
     const startTime = Date.now();
 
     const tenant = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
       include: {
-        aiRules: {
-          where: { isActive: true },
-          orderBy: { priority: 'asc' },
-        },
-        aiKnowledgeItems: {
-          where: { isActive: true },
-        },
-        aiTrainingExamples: {
-          where: { isApproved: true },
-          take: 5,
-        },
         problemTypes: {
           where: { isActive: true },
           orderBy: { name: 'asc' },
@@ -398,13 +440,47 @@ export class AiTrainingService {
       throw new NotFoundException('Compañía no encontrada');
     }
 
-    // Determinar API Key de Gemini: prioriza la del tenant, con fallback a la del sistema
-    const apiKey = tenant.geminiApiKey?.trim() || this.configService.get<string>('GEMINI_API_KEY');
+    const resolvedAgent = await resolveTenantAgent(this.prisma, tenantId, scope);
+    const agent = resolvedAgent
+      ? await this.prisma.whatsAppAgent.findUnique({
+          where: { id: resolvedAgent.id },
+          include: {
+            aiRules: {
+              where: { isActive: true },
+              orderBy: { priority: 'asc' },
+            },
+            aiKnowledgeItems: {
+              where: { isActive: true },
+            },
+            aiTrainingExamples: {
+              where: { isApproved: true },
+              take: 5,
+            },
+          },
+        })
+      : null;
+
+    const effectiveContext = {
+      name: tenant.name,
+      aiSystemPrompt: agent?.aiSystemPrompt ?? tenant.aiSystemPrompt,
+      aiRules: agent?.aiRules ?? [],
+      aiKnowledgeItems: agent?.aiKnowledgeItems ?? [],
+      aiTrainingExamples: agent?.aiTrainingExamples ?? [],
+      problemTypes: tenant.problemTypes,
+    };
+
+    // Determinar API Key de Gemini: prioriza la del agente/tenant, con fallback a la del sistema
+    const apiKey =
+      agent?.geminiApiKey?.trim() ||
+      tenant.geminiApiKey?.trim() ||
+      this.configService.get<string>('GEMINI_API_KEY');
     let model = resolveGeminiModel(
-      tenant.geminiModel,
+      agent?.geminiModel || tenant.geminiModel,
       this.configService.get<string>('GEMINI_MODEL'),
     );
-    const systemInstructions = `${buildTenantAiSystemInstructions(tenant)}\n\n${TICKET_ESCALATION_PROTOCOL}`;
+    const temperature = agent?.aiTemperature ?? tenant.aiTemperature ?? 0.2;
+    const aiEnabled = agent?.aiEnabled ?? tenant.aiEnabled;
+    const systemInstructions = `${buildTenantAiSystemInstructions(effectiveContext)}\n\n${TICKET_ESCALATION_PROTOCOL}`;
 
     let responseText = '';
     let isLiveAi = false;
@@ -425,7 +501,7 @@ export class AiTrainingService {
           preferredModel: model,
           systemInstruction: systemInstructions,
           userContext,
-          temperature: tenant.aiTemperature ?? 0.2,
+          temperature,
         });
         model = modelUsed;
         const parsed = parseEscalationOutput(rawText);
@@ -438,7 +514,7 @@ export class AiTrainingService {
         responseText = `[Modo Simulación Fallback]: Error API Gemini (${err.message}).`;
       }
     } else {
-      responseText = `[Modo Simulación Sin API Key]: ${tenant.name} tiene ${tenant.aiRules.length} reglas, ${tenant.aiKnowledgeItems.length} conocimientos y ${tenant.problemTypes.length} problemas ERP activos. Configura GEMINI_API_KEY para probar la respuesta en vivo.`;
+      responseText = `[Modo Simulación Sin API Key]: ${agent?.name || tenant.name} tiene ${effectiveContext.aiRules.length} reglas, ${effectiveContext.aiKnowledgeItems.length} conocimientos y ${tenant.problemTypes.length} problemas ERP activos. Configura GEMINI_API_KEY para probar la respuesta en vivo.`;
     }
 
     const executionTimeMs = Date.now() - startTime;
@@ -446,11 +522,11 @@ export class AiTrainingService {
     return {
       response: responseText,
       modelUsed: model,
-      aiEnabled: tenant.aiEnabled,
+      aiEnabled,
       isLiveAi,
-      rulesCount: tenant.aiRules.length,
-      knowledgeCount: tenant.aiKnowledgeItems.length,
-      examplesCount: tenant.aiTrainingExamples.length,
+      rulesCount: effectiveContext.aiRules.length,
+      knowledgeCount: effectiveContext.aiKnowledgeItems.length,
+      examplesCount: effectiveContext.aiTrainingExamples.length,
       problemsCount: tenant.problemTypes.length,
       executionTimeMs,
     };

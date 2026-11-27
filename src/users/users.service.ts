@@ -13,6 +13,13 @@ import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { Role } from '@prisma/client';
+import {
+  PERMISSION_DEFINITIONS,
+  PERMISSIONS,
+  ROLE_DEFAULT_PERMISSIONS,
+  TECHNICAL_SERVICE_BUNDLE,
+} from '../auth/constants/permissions.constant';
+import { resolveEffectivePermissions, syncUserPermissions } from '../auth/permissions.helper';
 
 @Injectable()
 export class UsersService {
@@ -23,26 +30,51 @@ export class UsersService {
     private readonly auditService: AuditService,
   ) {}
 
+  private canManageUsers(currentUser: any): boolean {
+    return (
+      currentUser.role === Role.SUPER_ADMIN ||
+      currentUser.role === Role.ADMIN ||
+      Boolean(currentUser.permissions?.includes(PERMISSIONS.MANAGE_USERS_ROLES))
+    );
+  }
+
+  /**
+   * Catálogo de permisos y módulos disponibles para asignación por usuario
+   */
+  async getPermissionsCatalog(currentUser: any) {
+    if (!this.canManageUsers(currentUser)) {
+      throw new ForbiddenException('No tienes permisos para consultar el catálogo de permisos');
+    }
+
+    return {
+      permissions: PERMISSION_DEFINITIONS,
+      roleDefaults: ROLE_DEFAULT_PERMISSIONS,
+      bundles: {
+        TECHNICAL_SERVICE: TECHNICAL_SERVICE_BUNDLE,
+      },
+    };
+  }
+
   /**
    * Obtiene la lista de usuarios de la compañía actual (o todas si es Superadmin)
    */
   async findAll(currentUser: any, queryTenantId?: string) {
-    if (currentUser.role !== Role.SUPER_ADMIN && currentUser.role !== Role.ADMIN) {
+    if (!this.canManageUsers(currentUser)) {
       throw new ForbiddenException('Solo administradores pueden consultar el listado de usuarios');
     }
 
     const where: any = {};
 
-    if (currentUser.role === Role.ADMIN) {
+    if (currentUser.role !== Role.SUPER_ADMIN) {
       if (!currentUser.tenantId) {
         throw new ForbiddenException('El usuario administrador no tiene una compañía asociada');
       }
       where.tenantId = currentUser.tenantId;
-    } else if (currentUser.role === Role.SUPER_ADMIN && queryTenantId) {
+    } else if (queryTenantId) {
       where.tenantId = queryTenantId;
     }
 
-    return this.prisma.user.findMany({
+    const users = await this.prisma.user.findMany({
       where,
       orderBy: { createdAt: 'desc' },
       select: {
@@ -51,6 +83,7 @@ export class UsersService {
         email: true,
         role: true,
         isActive: true,
+        useCustomPermissions: true,
         createdAt: true,
         updatedAt: true,
         tenantId: true,
@@ -63,13 +96,20 @@ export class UsersService {
         },
       },
     });
+
+    return Promise.all(
+      users.map(async (u) => ({
+        ...u,
+        permissions: await resolveEffectivePermissions(this.prisma, u),
+      })),
+    );
   }
 
   /**
    * Obtiene el detalle de un usuario específico
    */
   async findOne(id: string, currentUser: any) {
-    if (currentUser.role !== Role.SUPER_ADMIN && currentUser.role !== Role.ADMIN) {
+    if (!this.canManageUsers(currentUser)) {
       throw new ForbiddenException('Solo administradores pueden consultar el detalle de un usuario');
     }
 
@@ -81,6 +121,7 @@ export class UsersService {
         email: true,
         role: true,
         isActive: true,
+        useCustomPermissions: true,
         createdAt: true,
         updatedAt: true,
         tenantId: true,
@@ -98,18 +139,21 @@ export class UsersService {
       throw new NotFoundException('Usuario no encontrado');
     }
 
-    if (currentUser.role === Role.ADMIN && user.tenantId !== currentUser.tenantId) {
+    if (currentUser.role !== Role.SUPER_ADMIN && user.tenantId !== currentUser.tenantId) {
       throw new ForbiddenException('No tienes permisos para consultar este usuario');
     }
 
-    return user;
+    return {
+      ...user,
+      permissions: await resolveEffectivePermissions(this.prisma, user),
+    };
   }
 
   /**
    * Crea un nuevo usuario en la empresa
    */
   async create(dto: CreateUserDto, currentUser: any) {
-    if (currentUser.role !== Role.SUPER_ADMIN && currentUser.role !== Role.ADMIN) {
+    if (!this.canManageUsers(currentUser)) {
       throw new ForbiddenException('Solo administradores pueden dar de alta nuevos usuarios');
     }
 
@@ -152,9 +196,21 @@ export class UsersService {
         email: true,
         role: true,
         isActive: true,
+        useCustomPermissions: true,
         createdAt: true,
         tenantId: true,
       },
+    });
+
+    let useCustom = newUser.useCustomPermissions;
+    if (Array.isArray(dto.permissions) && newUser.role !== Role.SUPER_ADMIN) {
+      await syncUserPermissions(this.prisma, newUser.id, dto.permissions);
+      useCustom = true;
+    }
+
+    const effectivePermissions = await resolveEffectivePermissions(this.prisma, {
+      ...newUser,
+      useCustomPermissions: useCustom,
     });
 
     await this.auditService.log({
@@ -167,19 +223,24 @@ export class UsersService {
         userName: newUser.name,
         userEmail: newUser.email,
         role: newUser.role,
+        permissions: effectivePermissions,
       },
     });
 
     this.logger.log(`✔ Usuario creado: ${newUser.name} (${newUser.email}) con rol ${newUser.role}`);
 
-    return newUser;
+    return {
+      ...newUser,
+      useCustomPermissions: useCustom,
+      permissions: effectivePermissions,
+    };
   }
 
   /**
-   * Modifica los datos básicos o rol de un usuario existente
+   * Modifica los datos básicos, rol o permisos de un usuario existente
    */
   async update(id: string, dto: UpdateUserDto, currentUser: any) {
-    if (currentUser.role !== Role.SUPER_ADMIN && currentUser.role !== Role.ADMIN) {
+    if (!this.canManageUsers(currentUser)) {
       throw new ForbiddenException('Solo administradores pueden modificar usuarios');
     }
 
@@ -243,6 +304,10 @@ export class UsersService {
       dataToUpdate.isActive = dto.isActive;
     }
 
+    if (dto.useCustomPermissions === false) {
+      dataToUpdate.useCustomPermissions = false;
+    }
+
     const updatedUser = await this.prisma.user.update({
       where: { id },
       data: dataToUpdate,
@@ -252,10 +317,25 @@ export class UsersService {
         email: true,
         role: true,
         isActive: true,
+        useCustomPermissions: true,
         createdAt: true,
         updatedAt: true,
         tenantId: true,
       },
+    });
+
+    let useCustom = updatedUser.useCustomPermissions;
+    if (Array.isArray(dto.permissions) && updatedUser.role !== Role.SUPER_ADMIN) {
+      await syncUserPermissions(this.prisma, updatedUser.id, dto.permissions);
+      useCustom = true;
+    } else if (dto.useCustomPermissions === false) {
+      await this.prisma.userPermission.deleteMany({ where: { userId: updatedUser.id } });
+      useCustom = false;
+    }
+
+    const effectivePermissions = await resolveEffectivePermissions(this.prisma, {
+      ...updatedUser,
+      useCustomPermissions: useCustom,
     });
 
     if (existingUser.tenantId) {
@@ -271,13 +351,18 @@ export class UsersService {
           userEmail: updatedUser.email,
           role: updatedUser.role,
           isActive: updatedUser.isActive,
+          permissions: effectivePermissions,
         },
       });
     }
 
     this.logger.log(`✔ Usuario actualizado: ${updatedUser.name} (${updatedUser.email})`);
 
-    return updatedUser;
+    return {
+      ...updatedUser,
+      useCustomPermissions: useCustom,
+      permissions: effectivePermissions,
+    };
   }
 
   /**

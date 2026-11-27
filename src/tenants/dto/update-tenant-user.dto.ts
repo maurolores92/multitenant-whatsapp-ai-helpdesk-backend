@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsEmail, MinLength, IsEnum, IsBoolean } from 'class-validator';
+import { IsString, IsOptional, IsEmail, MinLength, IsEnum, IsBoolean, IsArray } from 'class-validator';
 import { Role } from '@prisma/client';
 
 export class UpdateTenantUserDto {
@@ -22,4 +22,9 @@ export class UpdateTenantUserDto {
   @IsBoolean()
   @IsOptional()
   isActive?: boolean;
+
+  @IsArray()
+  @IsString({ each: true })
+  @IsOptional()
+  permissions?: string[];
 }

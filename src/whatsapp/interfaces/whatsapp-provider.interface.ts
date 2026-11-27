@@ -7,6 +7,7 @@ export interface SendMessageResult {
 export interface IWhatsAppProvider {
   sendTextMessage(params: {
     tenantId: string;
+    agentId?: string;
     to: string;
     text: string;
   }): Promise<SendMessageResult>;

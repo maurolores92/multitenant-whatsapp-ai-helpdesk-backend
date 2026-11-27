@@ -3,6 +3,7 @@ import {
   Get,
   Post,
   Patch,
+  Delete,
   Body,
   Param,
   UseGuards,
@@ -45,14 +46,22 @@ export class TenantsController {
   }
 
   /**
-   * Crear nueva compañía y su Administrador (Exclusivo Superadmin)
+   * Creación manual de compañías deshabilitada (modo empresa única HelpCopies SRL)
    */
   @Post()
   async create(@Body() dto: CreateTenantDto, @CurrentUser() user: any) {
-    if (user.role !== Role.SUPER_ADMIN) {
-      throw new ForbiddenException('Solo el Superadministrador puede dar de alta nuevas compañías');
-    }
     return this.tenantsService.create(dto, user.id);
+  }
+
+  /**
+   * Protección explícita contra eliminación de la empresa principal
+   */
+  @Delete(':id')
+  async remove(@Param('id') id: string, @CurrentUser() user: any) {
+    if (user.role !== Role.SUPER_ADMIN) {
+      throw new ForbiddenException('No autorizado');
+    }
+    return this.tenantsService.remove(id);
   }
 
   /**

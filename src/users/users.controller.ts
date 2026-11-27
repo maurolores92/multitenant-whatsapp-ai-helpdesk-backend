@@ -29,6 +29,14 @@ export class UsersController {
   }
 
   /**
+   * Catálogo de permisos y módulos disponibles para asignar por usuario
+   */
+  @Get('permissions-catalog')
+  async getPermissionsCatalog(@CurrentUser() user: any) {
+    return this.usersService.getPermissionsCatalog(user);
+  }
+
+  /**
    * Detalle de un usuario
    */
   @Get(':id')

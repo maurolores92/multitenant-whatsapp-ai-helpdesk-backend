@@ -24,6 +24,7 @@ import {
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
 } from './ai-prompt.helper';
+import { resolveTenantAgent } from '../agents/agents.helper';
 
 @Injectable()
 export class AiSupportService {
@@ -40,17 +41,20 @@ export class AiSupportService {
 
   /**
    * Procesa un mensaje entrante cuando la conversación está en BOT_HANDLING.
-   * Respeta la configuración y entrenamiento definidos por el SuperAdmin por compañía.
+   * Usa la configuración y entrenamiento específicos del WhatsAppAgent que recibió el mensaje.
    */
   async processCustomerMessage(params: {
     tenantId: string;
+    agentId?: string;
     conversationId: string;
     customerId: string;
     messageText: string;
   }) {
-    const { tenantId, conversationId, customerId, messageText } = params;
+    const { tenantId, agentId, conversationId, customerId, messageText } = params;
 
-    const [customer, tenant, recentMessages] = await Promise.all([
+    const resolvedAgent = await resolveTenantAgent(this.prisma, tenantId, { agentId });
+
+    const [customer, tenant, agentWithTraining, recentMessages] = await Promise.all([
       this.prisma.customer.findUnique({
         where: { id: customerId },
         include: { equipments: true },
@@ -64,6 +68,16 @@ export class AiSupportService {
           problemTypes: { where: { isActive: true }, orderBy: { name: 'asc' } },
         },
       }),
+      resolvedAgent
+        ? this.prisma.whatsAppAgent.findUnique({
+            where: { id: resolvedAgent.id },
+            include: {
+              aiRules: { where: { isActive: true }, orderBy: { priority: 'asc' } },
+              aiKnowledgeItems: { where: { isActive: true } },
+              aiTrainingExamples: { where: { isApproved: true }, take: 5 },
+            },
+          })
+        : Promise.resolve(null),
       this.prisma.message.findMany({
         where: { conversationId },
         orderBy: { createdAt: 'desc' },
@@ -73,8 +87,25 @@ export class AiSupportService {
 
     if (!customer || !tenant) return;
 
-    // Si el SuperAdmin desactivó la IA de la compañía, deriva directo a cola humana
-    if (!tenant.aiEnabled) {
+    const effectiveAi = agentWithTraining
+      ? {
+          ...tenant,
+          id: tenant.id,
+          name: tenant.name,
+          aiEnabled: agentWithTraining.aiEnabled,
+          geminiApiKey: agentWithTraining.geminiApiKey ?? tenant.geminiApiKey,
+          geminiModel: agentWithTraining.geminiModel || tenant.geminiModel,
+          aiTemperature: agentWithTraining.aiTemperature ?? tenant.aiTemperature,
+          aiSystemPrompt: agentWithTraining.aiSystemPrompt ?? tenant.aiSystemPrompt,
+          aiRules: agentWithTraining.aiRules,
+          aiKnowledgeItems: agentWithTraining.aiKnowledgeItems,
+          aiTrainingExamples: agentWithTraining.aiTrainingExamples,
+          problemTypes: tenant.problemTypes,
+        }
+      : tenant;
+
+    // Si la IA del agente está desactivada, deriva directo a cola humana
+    if (!effectiveAi.aiEnabled) {
       await this.prisma.conversation.update({
         where: { id: conversationId },
         data: { status: ConversationStatus.WAITING_AGENT },
@@ -98,7 +129,7 @@ export class AiSupportService {
     const orderedHistory = [...recentMessages].reverse();
 
     const { replyText, shouldEscalate, escalationData } = await this.runAiDiagnostic({
-      tenant,
+      tenant: effectiveAi,
       customer,
       recentMessages: orderedHistory,
       latestMessage: messageText,
@@ -107,6 +138,7 @@ export class AiSupportService {
     if (shouldEscalate && escalationData) {
       await this.escalateToHuman({
         tenantId,
+        agentId: agentWithTraining?.id,
         conversationId,
         customerId: escalationData.resolvedCustomerId || customer.id,
         reason: escalationData.reason,
@@ -135,6 +167,7 @@ export class AiSupportService {
 
     await this.metaCloudApiService.sendTextMessage({
       tenantId,
+      agentId: agentWithTraining?.id,
       to: customer.phone,
       text: replyText,
     });
@@ -296,6 +329,7 @@ export class AiSupportService {
    */
   private async escalateToHuman(params: {
     tenantId: string;
+    agentId?: string;
     conversationId: string;
     customerId: string;
     reason: string;
@@ -308,6 +342,7 @@ export class AiSupportService {
   }) {
     const {
       tenantId,
+      agentId,
       conversationId,
       customerId,
       reason,
@@ -330,6 +365,7 @@ export class AiSupportService {
     const ticket = await this.prisma.ticket.create({
       data: {
         tenantId,
+        agentId: agentId || null,
         customerId,
         conversationId,
         equipmentId,

@@ -77,6 +77,8 @@ async function main() {
           name: 'HelpCopies SRL',
           slug: 'helpcopies',
           whatsappPhone: '+54 9 11 5555-0199',
+          isSystem: true,
+          isActive: true,
         },
       });
     } else {
@@ -86,6 +88,8 @@ async function main() {
           slug: 'helpcopies',
           whatsappPhone: '+54 9 11 5555-0199',
           aiEnabled: true,
+          isSystem: true,
+          isActive: true,
         },
       });
     }

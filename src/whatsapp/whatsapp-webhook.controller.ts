@@ -13,6 +13,7 @@ import type { Response } from 'express';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChatService } from '../chat/chat.service';
+import { ensureDefaultTechnicalAgent } from '../agents/agents.helper';
 
 @Controller('whatsapp/webhook')
 export class WhatsAppWebhookController {
@@ -72,21 +73,43 @@ export class WhatsAppWebhookController {
           const phoneNumberId = value.metadata?.phone_number_id;
           if (!phoneNumberId) continue;
 
-          // 1. Identificar la empresa (Tenant) correspondiente al número receptor
-          let tenant = await this.prisma.tenant.findUnique({
+          // 1. Identificar el Agente/Teléfono específico y su empresa (HelpCopies SRL)
+          let agent = await this.prisma.whatsAppAgent.findUnique({
             where: { whatsappPhoneNumberId: phoneNumberId },
+            include: { tenant: true },
           });
 
-          // Si es un entorno de pruebas o desarrollo, usar el primer tenant activo si no está asignado
+          let tenant = agent?.tenant ?? null;
+
+          // Fallback por compatibilidad si aún estaba guardado solo en Tenant o modo pruebas
           if (!tenant) {
-            tenant = await this.prisma.tenant.findFirst({
-              where: { isActive: true },
-            });
+            tenant =
+              (await this.prisma.tenant.findUnique({
+                where: { whatsappPhoneNumberId: phoneNumberId },
+              })) ??
+              (await this.prisma.tenant.findFirst({
+                where: { isActive: true },
+                orderBy: { createdAt: 'asc' },
+              }));
+
+            if (tenant) {
+              const ensured = await ensureDefaultTechnicalAgent(this.prisma, tenant.id);
+              if (ensured) {
+                agent = { ...ensured, tenant };
+              }
+            }
           }
 
-          if (!tenant) {
+          if (!tenant || !tenant.isActive) {
             this.logger.warn(
-              `Webhook recibido para Phone Number ID ${phoneNumberId}, pero no hay empresa vinculada.`,
+              `Webhook recibido para Phone Number ID ${phoneNumberId}, pero no hay empresa activa vinculada.`,
+            );
+            continue;
+          }
+
+          if (agent && !agent.isActive) {
+            this.logger.warn(
+              `Webhook recibido para el agente inactivo '${agent.name}' (${phoneNumberId}). Mensaje ignorado.`,
             );
             continue;
           }
@@ -109,6 +132,7 @@ export class WhatsAppWebhookController {
             if (text && fromPhone) {
               await this.chatService.handleIncomingCustomerMessage({
                 tenantId: tenant.id,
+                agentId: agent?.id,
                 fromPhone,
                 customerName,
                 text,

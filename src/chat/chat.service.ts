@@ -12,7 +12,8 @@ import { MetaCloudApiService } from '../whatsapp/providers/meta-cloud-api.servic
 import { EventsGateway } from '../notifications/events.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
 import { AiSupportService } from '../ai/ai-support.service';
-import { ConversationStatus, SenderType } from '@prisma/client';
+import { AgentArea, ConversationStatus, SenderType } from '@prisma/client';
+import { resolveTenantAgent } from '../agents/agents.helper';
 
 @Injectable()
 export class ChatService {
@@ -33,12 +34,15 @@ export class ChatService {
    */
   async handleIncomingCustomerMessage(params: {
     tenantId: string;
+    agentId?: string;
     fromPhone: string;
     customerName?: string;
     text: string;
     whatsappMessageId: string;
   }) {
-    const { tenantId, fromPhone, customerName, text, whatsappMessageId } = params;
+    const { tenantId, agentId, fromPhone, customerName, text, whatsappMessageId } = params;
+    const resolvedAgent = await resolveTenantAgent(this.prisma, tenantId, { agentId });
+    const targetAgentId = resolvedAgent?.id;
 
     // 1. Deduplicación: Meta reintenta webhooks si no recibe 200 rápido
     const existingMessage = await this.prisma.message.findFirst({
@@ -86,11 +90,12 @@ export class ChatService {
       }
     }
 
-    // 3. Buscar conversación activa (no resuelta) o crear una nueva
+    // 3. Buscar conversación activa (no resuelta) para este cliente y agente/línea o crear una nueva
     let conversation = await this.prisma.conversation.findFirst({
       where: {
         tenantId,
         customerId: customer.id,
+        ...(targetAgentId ? { agentId: targetAgentId } : {}),
         status: {
           not: ConversationStatus.RESOLVED,
         },
@@ -102,6 +107,7 @@ export class ChatService {
       conversation = await this.prisma.conversation.create({
         data: {
           tenantId,
+          agentId: targetAgentId ?? null,
           customerId: customer.id,
           status: ConversationStatus.BOT_HANDLING, // Inicia con triaje IA
         },
@@ -146,11 +152,12 @@ export class ChatService {
       });
     }
 
-    // 7. Si la conversación está en manos del Bot IA, procesar triaje automático
+    // 7. Si la conversación está en manos del Bot IA, procesar triaje automático con el agente asignado
     if (conversation.status === ConversationStatus.BOT_HANDLING) {
       this.logger.log(`Invocando triaje de IA para conversación ${conversation.id}...`);
       await this.aiSupportService.processCustomerMessage({
         tenantId,
+        agentId: conversation.agentId ?? targetAgentId,
         conversationId: conversation.id,
         customerId: customer.id,
         messageText: text,
@@ -201,10 +208,10 @@ export class ChatService {
       throw new ForbiddenException('Usuario operador no encontrado');
     }
 
-    // 3. Despachar a Meta Cloud API
-    // Se envía el mensaje directamente al WhatsApp del cliente
+    // 3. Despachar a Meta Cloud API usando la línea/agente dueño de la conversación
     const result = await this.metaCloudApiService.sendTextMessage({
       tenantId,
+      agentId: conversation.agentId ?? undefined,
       to: conversation.customer.phone,
       text,
     });
@@ -269,15 +276,34 @@ export class ChatService {
   }
 
   /**
-   * Obtiene la lista de conversaciones de la empresa con filtros
+   * Obtiene la lista de conversaciones de la empresa con filtros opcionales por estado, área o agente
    */
-  async getConversations(tenantId: string, status?: ConversationStatus) {
+  async getConversations(
+    tenantId: string,
+    status?: ConversationStatus,
+    options?: { area?: AgentArea; agentId?: string },
+  ) {
     return this.prisma.conversation.findMany({
       where: {
         tenantId,
         ...(status ? { status } : {}),
+        ...(options?.agentId ? { agentId: options.agentId } : {}),
+        ...(options?.area
+          ? {
+              OR: [{ agent: { area: options.area } }, ...(options.area === AgentArea.TECHNICAL_SERVICE ? [{ agentId: null }] : [])],
+            }
+          : {}),
       },
       include: {
+        agent: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            area: true,
+            whatsappPhone: true,
+          },
+        },
         customer: {
           include: {
             equipments: {

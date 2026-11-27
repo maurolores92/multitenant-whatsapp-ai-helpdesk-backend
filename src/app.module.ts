@@ -14,6 +14,7 @@ import { TenantsModule } from './tenants/tenants.module';
 import { AiTrainingModule } from './ai-training/ai-training.module';
 import { UsersModule } from './users/users.module';
 import { ErpSyncModule } from './erp-sync/erp-sync.module';
+import { AgentsModule } from './agents/agents.module';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { ErpSyncModule } from './erp-sync/erp-sync.module';
     AiTrainingModule,
     UsersModule,
     ErpSyncModule,
+    AgentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
