@@ -62,14 +62,39 @@ enum TicketStatus {
   ASSIGNED
   IN_PROGRESS
   WAITING_PARTS
+  WORKSHOP
+  SCHEDULED_VISIT
   RESOLVED
   CANCELLED
+}
+
+enum TicketSource {
+  AI_WHATSAPP
+  WHATSAPP_AGENT
+  MANUAL_INTERNAL
+}
+
+enum TicketReason {
+  MECHANICAL_FAILURE
+  ELECTRICAL_ERROR
+  TONER_SUPPLIES
+  CALIBRATION_SOFTWARE
+  PREVENTIVE_MAINTENANCE
+  ADMINISTRATIVE
+  OTHER
 }
 
 enum EquipmentStatus {
   ACTIVE
   IN_REPAIR
   DECOMMISSIONED
+}
+
+enum ErpAuthType {
+  NONE
+  BEARER_TOKEN
+  API_KEY
+  LOGIN_CREDENTIALS
 }
 
 // ----------------------------------------------------
@@ -114,6 +139,8 @@ model Tenant {
   aiRules           AiRule[]
   aiKnowledgeItems  AiKnowledgeItem[]
   aiTrainingExamples AiTrainingExample[]
+  erpIntegration    ErpIntegration?
+  problemTypes      ProblemType[]
 
   @@map("tenants")
 }
@@ -227,11 +254,14 @@ model Customer {
   tenantId      String
   tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   
+  externalCode  String?        // Código de cliente en ERP externo (ej. COD_CLIENT de Tango / HelpCopies ERP)
   name          String
   phone         String         // Número normalizado E.164 (ej. +54911...)
   email         String?
   companyName   String?
+  cuit          String?
   address       String?
+  locality      String?
   notes         String?        @db.Text
   
   createdAt     DateTime       @default(now())
@@ -243,6 +273,7 @@ model Customer {
 
   @@unique([tenantId, phone])
   @@index([tenantId, phone])
+  @@index([tenantId, externalCode])
   @@map("customers")
 }
 
@@ -254,7 +285,9 @@ model Equipment {
   customerId     String
   customer       Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
   
-  name           String          // Nombre descriptivo (ej: Compresor 500L, Servidor Central)
+  externalCode   String?         // ID o código único del equipo en HelpCopies ERP
+  clientCode     String?         // COD_CLIENT de referencia para ETL mensual
+  name           String          // Nombre descriptivo (ej: Ricoh MP 301, Ecoflex 3000)
   brand          String?
   model          String?
   serialNumber   String?
@@ -269,6 +302,7 @@ model Equipment {
 
   @@index([tenantId, customerId])
   @@index([tenantId, serialNumber])
+  @@index([tenantId, clientCode])
   @@map("equipments")
 }
 
@@ -356,8 +390,13 @@ model Ticket {
   serviceType          ServiceType    // REMOTE_WHATSAPP o ONSITE_PHYSICAL
   priority             TicketPriority @default(MEDIUM)
   status               TicketStatus   @default(OPEN)
+  source               TicketSource   @default(AI_WHATSAPP)
+  reason               TicketReason   @default(OTHER)
   
   serviceOrderNumber   String?        // Número de orden de servicio (ERP Tango u orden interna)
+  scheduledDate        DateTime?      // Fecha programada de visita técnica
+  problemTypeId        String?
+  problemType          ProblemType?   @relation(fields: [problemTypeId], references: [id], onDelete: SetNull)
   assignedTechnicianId String?
   assignedTechnician   User?          @relation("TechnicianAssignedTickets", fields: [assignedTechnicianId], references: [id])
   
@@ -419,4 +458,59 @@ model AiTrainingExample {
 
   @@index([tenantId, isApproved])
   @@map("ai_training_examples")
+}
+
+// ----------------------------------------------------
+// INTEGRACIÓN Y SINCRONIZACIÓN ETL CON HELPCOPIES ERP
+// ----------------------------------------------------
+
+model ErpIntegration {
+  id                 String      @id @default(uuid())
+  tenantId           String      @unique
+  tenant             Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  baseUrl            String?     @default("https://api.helpcopies.com/api")
+  authType           ErpAuthType @default(BEARER_TOKEN)
+  apiKey             String?     @db.Text
+  apiKeyHeader       String      @default("x-api-key")
+  loginEndpoint      String?     @default("/auth/login")
+  username           String?
+  password           String?     @db.Text
+
+  customersEndpoint  String      @default("/clients")
+  equipmentsEndpoint String      @default("/machines")
+  problemsEndpoint   String      @default("/problems")
+
+  autoSyncMonthly    Boolean     @default(true)
+  isActive           Boolean     @default(false)
+  lastSyncAt         DateTime?
+  lastSyncStatus     String?
+  lastSyncSummary    Json?
+
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  @@map("erp_integrations")
+}
+
+model ProblemType {
+  id                 String       @id @default(uuid())
+  tenantId           String
+  tenant             Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  externalCode       String?
+  name               String
+  description        String?      @db.Text
+  defaultReason      TicketReason @default(OTHER)
+  defaultServiceType ServiceType  @default(ONSITE_PHYSICAL)
+  isActive           Boolean      @default(true)
+
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  tickets            Ticket[]
+
+  @@index([tenantId, externalCode])
+  @@index([tenantId, isActive])
+  @@map("problem_types")
 }

@@ -11,6 +11,11 @@ import { UpdateAiConfigDto } from './dto/update-ai-config.dto';
 import { CreateAiRuleDto, UpdateAiRuleDto } from './dto/ai-rule.dto';
 import { CreateAiKnowledgeDto, UpdateAiKnowledgeDto } from './dto/ai-knowledge.dto';
 import { CreateAiExampleDto } from './dto/ai-example.dto';
+import {
+  buildTenantAiSystemInstructions,
+  parseEscalationOutput,
+  TICKET_ESCALATION_PROTOCOL,
+} from '../ai/ai-prompt.helper';
 
 @Injectable()
 export class AiTrainingService {
@@ -376,6 +381,10 @@ export class AiTrainingService {
           where: { isApproved: true },
           take: 5,
         },
+        problemTypes: {
+          where: { isActive: true },
+          orderBy: { name: 'asc' },
+        },
       },
     });
 
@@ -386,40 +395,7 @@ export class AiTrainingService {
     // Determinar API Key de Gemini: prioriza la del tenant, con fallback a la del sistema
     const apiKey = tenant.geminiApiKey?.trim() || this.configService.get<string>('GEMINI_API_KEY');
     const model = tenant.geminiModel || 'gemini-2.0-flash';
-
-    // Ensamblado dinámico del prompt
-    let systemInstructions = `Eres el Asistente Virtual Oficial de la empresa "${tenant.name}".
-Atiendes clientes cordialmente por WhatsApp.
-${tenant.aiSystemPrompt ? `DIRECTIVA BASE:\n${tenant.aiSystemPrompt}\n` : ''}
-`;
-
-    if (tenant.aiRules.length > 0) {
-      systemInstructions += `\nREGLAS DE OBLIGATORIO CUMPLIMIENTO:\n`;
-      tenant.aiRules.forEach((rule, idx) => {
-        systemInstructions += `${idx + 1}. [${rule.category}] ${rule.title}: ${rule.instruction}\n`;
-      });
-    }
-
-    if (tenant.aiKnowledgeItems.length > 0) {
-      systemInstructions += `\nBASE DE CONOCIMIENTOS OFICIALES:\n`;
-      tenant.aiKnowledgeItems.forEach((kb) => {
-        systemInstructions += `P: ${kb.question}\nR: ${kb.answer}\n`;
-      });
-    }
-
-    if (tenant.aiTrainingExamples.length > 0) {
-      systemInstructions += `\nEJEMPLOS DE RESPUESTAS APROBADAS POR OPERADORES HUMANOS:\n`;
-      tenant.aiTrainingExamples.forEach((ex) => {
-        systemInstructions += `Cliente: "${ex.customerInput}" ➔ Asistente: "${ex.idealResponse}"\n`;
-      });
-    }
-
-    const fullPrompt = `${systemInstructions}
-----------------------------------------
-Mensaje recibido del cliente en el simulador:
-"${message}"
-
-Responde como el asistente oficial siguiendo estrictamente las reglas anteriores.`;
+    const systemInstructions = `${buildTenantAiSystemInstructions(tenant)}\n\n${TICKET_ESCALATION_PROTOCOL}`;
 
     let responseText = '';
     let isLiveAi = false;
@@ -429,16 +405,23 @@ Responde como el asistente oficial siguiendo estrictamente las reglas anteriores
         const client = new GoogleGenAI({ apiKey });
         const res = await client.models.generateContent({
           model,
-          contents: fullPrompt,
+          contents: `Mensaje recibido del cliente en el simulador:\n"${message}"`,
+          config: {
+            systemInstruction: systemInstructions,
+            temperature: tenant.aiTemperature ?? 0.2,
+          },
         });
-        responseText = res.text?.trim() || 'No se recibió respuesta del modelo';
+        const parsed = parseEscalationOutput(res.text || '');
+        responseText = parsed.escalationPayload
+          ? `${parsed.replyText}\n\n[Simulación de Ticket IA]: ${JSON.stringify(parsed.escalationPayload)}`
+          : parsed.replyText || 'No se recibió respuesta del modelo';
         isLiveAi = true;
       } catch (err: any) {
         this.logger.error(`Error en simulación Gemini: ${err.message}`);
-        responseText = `[Modo Heurístico / Simulación Fallback]: Gracias por contactar a ${tenant.name}. Recibimos tu consulta: "${message}". (Error API: ${err.message})`;
+        responseText = `[Modo Simulación Fallback]: Error API Gemini (${err.message}).`;
       }
     } else {
-      responseText = `[Modo Simulación Sin API Key]: Hola, soy el asistente de ${tenant.name}. Hemos recibido tu mensaje "${message}" y aplicamos las ${tenant.aiRules.length} reglas activas configuradas.`;
+      responseText = `[Modo Simulación Sin API Key]: ${tenant.name} tiene ${tenant.aiRules.length} reglas, ${tenant.aiKnowledgeItems.length} conocimientos y ${tenant.problemTypes.length} problemas ERP activos. Configura GEMINI_API_KEY para probar la respuesta en vivo.`;
     }
 
     const executionTimeMs = Date.now() - startTime;
@@ -446,10 +429,12 @@ Responde como el asistente oficial siguiendo estrictamente las reglas anteriores
     return {
       response: responseText,
       modelUsed: model,
+      aiEnabled: tenant.aiEnabled,
       isLiveAi,
       rulesCount: tenant.aiRules.length,
       knowledgeCount: tenant.aiKnowledgeItems.length,
       examplesCount: tenant.aiTrainingExamples.length,
+      problemsCount: tenant.problemTypes.length,
       executionTimeMs,
     };
   }

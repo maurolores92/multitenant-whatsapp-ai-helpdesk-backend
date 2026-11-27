@@ -13,6 +13,7 @@ import { TicketsModule } from './tickets/tickets.module';
 import { TenantsModule } from './tenants/tenants.module';
 import { AiTrainingModule } from './ai-training/ai-training.module';
 import { UsersModule } from './users/users.module';
+import { ErpSyncModule } from './erp-sync/erp-sync.module';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { UsersModule } from './users/users.module';
     TenantsModule,
     AiTrainingModule,
     UsersModule,
+    ErpSyncModule,
   ],
   controllers: [AppController],
   providers: [AppService],

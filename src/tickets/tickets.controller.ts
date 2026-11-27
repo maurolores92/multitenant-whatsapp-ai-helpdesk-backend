@@ -9,13 +9,14 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { TicketsService } from './tickets.service';
+import { UpdateTicketDto } from './dto/update-ticket.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../auth/guards/permissions.guard';
 import { RequirePermissions } from '../auth/decorators/require-permissions.decorator';
 import { CurrentTenant } from '../auth/decorators/current-tenant.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { PERMISSIONS } from '../auth/constants/permissions.constant';
-import { TicketStatus, ServiceType, TicketPriority } from '@prisma/client';
+import { TicketStatus, ServiceType, TicketReason, TicketSource } from '@prisma/client';
 
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 @Controller('tickets')
@@ -23,18 +24,28 @@ export class TicketsController {
   constructor(private readonly ticketsService: TicketsService) {}
 
   @RequirePermissions(PERMISSIONS.READ_CHATS)
+  @Get('catalogs')
+  async getCatalogs(@CurrentTenant() tenantId: string) {
+    return this.ticketsService.getCatalogs(tenantId);
+  }
+
+  @RequirePermissions(PERMISSIONS.READ_CHATS)
   @Get()
   async getTickets(
     @CurrentTenant() tenantId: string,
     @Query('status') status?: TicketStatus,
     @Query('serviceType') serviceType?: ServiceType,
+    @Query('reason') reason?: TicketReason,
+    @Query('source') source?: TicketSource,
     @Query('limit') limit?: number,
   ) {
     return this.ticketsService.getTenantTickets({
       tenantId,
       status,
       serviceType,
-      limit: limit ? Number(limit) : 50,
+      reason,
+      source,
+      limit: limit ? Number(limit) : 100,
     });
   }
 
@@ -53,22 +64,9 @@ export class TicketsController {
     @CurrentTenant() tenantId: string,
     @CurrentUser('id') actorUserId: string,
     @Param('id') id: string,
-    @Body()
-    body: {
-      status?: TicketStatus;
-      priority?: TicketPriority;
-      serviceType?: ServiceType;
-      serviceOrderNumber?: string;
-      assignedTechnicianId?: string;
-      resolutionNotes?: string;
-    },
+    @Body() body: UpdateTicketDto,
   ) {
-    return this.ticketsService.updateTicket({
-      tenantId,
-      id,
-      actorUserId,
-      ...body,
-    });
+    return this.ticketsService.updateTicket(tenantId, id, body, actorUserId);
   }
 
   @RequirePermissions(PERMISSIONS.UPDATE_TICKET)

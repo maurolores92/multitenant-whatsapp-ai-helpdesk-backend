@@ -5,7 +5,13 @@
   "author": "",
   "private": true,
   "license": "UNLICENSED",
+  "packageManager": "pnpm@11.25.0",
   "scripts": {
+    "preinstall": "node -e \"if(!/pnpm/.test(process.env.npm_execpath||'')){console.error('\\n[ERROR] Este proyecto usa pnpm exclusivamente. Ejecuta: pnpm install\\n');process.exit(1)}\"",
+    "prestart:dev": "node -e \"if(!/pnpm/.test(process.env.npm_execpath||'')){console.error('\\n[ERROR] Este proyecto usa pnpm exclusivamente. Ejecuta: pnpm start:dev\\n');process.exit(1)}\"",
+    "prebuild": "node -e \"if(!/pnpm/.test(process.env.npm_execpath||'')){console.error('\\n[ERROR] Este proyecto usa pnpm exclusivamente. Ejecuta: pnpm build\\n');process.exit(1)}\"",
+    "prestart": "node -e \"if(!/pnpm/.test(process.env.npm_execpath||'')){console.error('\\n[ERROR] Este proyecto usa pnpm exclusivamente. Ejecuta: pnpm start\\n');process.exit(1)}\"",
+    "postinstall": "prisma generate",
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
