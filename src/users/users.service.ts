@@ -195,9 +195,22 @@ export class UsersService {
       throw new ForbiddenException('No tienes permisos para modificar usuarios de otra compañía');
     }
 
+    if (existingUser.role === Role.SUPER_ADMIN) {
+      if (currentUser.role !== Role.SUPER_ADMIN) {
+        throw new ForbiddenException('Solo un Superadministrador puede modificar a otro Superadministrador');
+      }
+      if (dto.role && dto.role !== Role.SUPER_ADMIN) {
+        throw new ForbiddenException('No se puede cambiar el rol de un usuario Superadministrador');
+      }
+    }
+
     // No permitir asignar SUPER_ADMIN si no es Superadmin
     if (dto.role === Role.SUPER_ADMIN && currentUser.role !== Role.SUPER_ADMIN) {
       throw new ForbiddenException('No tienes permisos para asignar el rol SUPER_ADMIN');
+    }
+
+    if (dto.role && dto.role !== Role.SUPER_ADMIN && !existingUser.tenantId) {
+      throw new BadRequestException('Un usuario sin compañía asociada solo puede tener rol SUPER_ADMIN');
     }
 
     const dataToUpdate: any = {};

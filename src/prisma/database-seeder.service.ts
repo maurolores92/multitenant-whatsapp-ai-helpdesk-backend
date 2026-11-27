@@ -88,10 +88,21 @@ export class DatabaseSeederService implements OnApplicationBootstrap {
     const salt = await bcrypt.genSalt(10);
     const defaultHashedPassword = await bcrypt.hash('password123', salt);
 
-    // 1. Crear Usuario Superadmin (Global, sin pertenecer a una sola empresa)
+    // Recuperar cualquier usuario global (sin compañía) cuyo rol haya quedado degradado por error
+    await this.prisma.user.updateMany({
+      where: {
+        tenantId: null,
+        role: { not: Role.SUPER_ADMIN },
+      },
+      data: {
+        role: Role.SUPER_ADMIN,
+      },
+    });
+
+    // 1. Crear Usuario Superadmin solo si aún no existe ninguno en el sistema
     const superAdminEmail = 'superadmin@admin.com';
-    let superAdmin = await this.prisma.user.findUnique({
-      where: { email: superAdminEmail },
+    let superAdmin = await this.prisma.user.findFirst({
+      where: { role: Role.SUPER_ADMIN },
     });
 
     if (!superAdmin) {
@@ -142,10 +153,13 @@ export class DatabaseSeederService implements OnApplicationBootstrap {
       }
     }
 
-    // 3. Crear Usuario Admin de Compañía (HelpCopies SRL)
+    // 3. Crear Usuario Admin de Compañía (HelpCopies SRL) solo si la compañía no tiene ningún ADMIN
     const companyAdminEmail = 'admin@helpcopies.com';
-    let companyAdmin = await this.prisma.user.findUnique({
-      where: { email: companyAdminEmail },
+    let companyAdmin = await this.prisma.user.findFirst({
+      where: {
+        tenantId: tenant.id,
+        role: Role.ADMIN,
+      },
     });
 
     if (!companyAdmin) {
@@ -178,15 +192,7 @@ export class DatabaseSeederService implements OnApplicationBootstrap {
       }
     }
 
-    // 4. Limpieza estricta: Eliminar usuarios que no hayan sido autorizados (carlos, lucia, etc.)
-    await this.prisma.user.deleteMany({
-      where: {
-        email: {
-          notIn: [superAdminEmail, companyAdminEmail],
-        },
-      },
-    });
-    this.logger.log('✔ Limpieza estricta: Solo existen Superadmin y Admin de HelpCopies SRL.');
+    this.logger.log('✔ Usuarios base (Superadmin y Admin de compañía) verificados.');
   }
 
   /**
