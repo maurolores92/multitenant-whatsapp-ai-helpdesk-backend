@@ -178,6 +178,7 @@ model WhatsAppAgent {
   aiSystemPrompt        String?         @db.Text
   aiEnabled             Boolean         @default(true)
   aiContextHours        Int             @default(24) // Ventana de memoria para Servicio Técnico (horas)
+  aiResponseDelaySeconds Int            @default(60) // Retardo controlado de envío para Servicio Técnico (segundos)
 
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt

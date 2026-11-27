@@ -17,6 +17,7 @@ import {
   buildTenantAiSystemInstructions,
   generateGeminiWithEquipmentTools,
   parseEscalationOutput,
+  prelookupEquipmentsFromTexts,
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
 } from '../ai/ai-prompt.helper';
@@ -83,6 +84,7 @@ export class AiTrainingService {
       aiSystemPrompt: agent.aiSystemPrompt ?? tenant.aiSystemPrompt,
       aiEnabled: agent.aiEnabled,
       aiContextHours: agent.aiContextHours ?? 24,
+      aiResponseDelaySeconds: agent.aiResponseDelaySeconds ?? 60,
       hasCustomApiKey,
       maskedApiKey,
       counts: {
@@ -134,6 +136,9 @@ export class AiTrainingService {
     if (dto.aiContextHours !== undefined) {
       updateData.aiContextHours = dto.aiContextHours;
     }
+    if (dto.aiResponseDelaySeconds !== undefined) {
+      updateData.aiResponseDelaySeconds = dto.aiResponseDelaySeconds;
+    }
 
     const updated = await this.prisma.whatsAppAgent.update({
       where: { id: agent.id },
@@ -141,7 +146,11 @@ export class AiTrainingService {
     });
 
     if (updated.isDefault) {
-      const { aiContextHours: _ignoredTenantField, ...tenantMirrorData } = updateData;
+      const {
+        aiContextHours: _ignoredContextHours,
+        aiResponseDelaySeconds: _ignoredDelay,
+        ...tenantMirrorData
+      } = updateData;
       if (Object.keys(tenantMirrorData).length > 0) {
         await this.prisma.tenant.update({
           where: { id: tenantId },
@@ -511,7 +520,7 @@ export class AiTrainingService {
     );
     const temperature = agent?.aiTemperature ?? tenant.aiTemperature ?? 0.2;
     const aiEnabled = agent?.aiEnabled ?? tenant.aiEnabled;
-    const systemInstructions = `${buildTenantAiSystemInstructions(effectiveContext)}\n\n${TICKET_ESCALATION_PROTOCOL}`;
+    const systemInstructions = `${buildTenantAiSystemInstructions(effectiveContext, { latestMessage: message })}\n\n${TICKET_ESCALATION_PROTOCOL}`;
 
     let responseText = '';
     let isLiveAi = false;
@@ -521,9 +530,31 @@ export class AiTrainingService {
     if (apiKey && apiKey !== 'your-gemini-api-key') {
       try {
         const client = new GoogleGenAI({ apiKey });
+        const customerHistoryTexts = recentMessages
+          .filter((m) => m.senderType === SenderType.CUSTOMER)
+          .slice(-3)
+          .map((m) => m.content);
+        const prematched = await prelookupEquipmentsFromTexts(this.prisma, tenant.id, [
+          message,
+          ...customerHistoryTexts,
+        ]);
+        const uniquePreMatch = prematched.length === 1 ? prematched[0] : undefined;
+
         const userContext = buildCustomerConversationContext({
-          customerName: 'Cliente Simulador',
-          equipments: [],
+          customerName: uniquePreMatch?.customer?.name || 'Cliente Simulador',
+          customerExternalCode: uniquePreMatch?.codClient || uniquePreMatch?.customer?.externalCode || null,
+          equipments: prematched.map((m) => ({
+            id: m.equipmentId,
+            name: m.name,
+            brand: m.brand,
+            model: m.model,
+            serialNumber: m.serialNumber,
+            externalCode: m.externalCode,
+            internalCode: m.internalCode,
+            codClient: m.codClient,
+            customerCompanyName: m.customer?.companyName || null,
+            customerName: m.customer?.name || null,
+          })),
           recentMessages,
           latestMessage: message,
         });
@@ -535,6 +566,8 @@ export class AiTrainingService {
           systemInstruction: systemInstructions,
           userContext,
           temperature,
+          initialMatchedEquipmentId: uniquePreMatch?.equipmentId,
+          initialMatchedCustomerId: uniquePreMatch?.customer?.customerId,
         });
         model = modelUsed;
         if (matchedEquipmentId) {

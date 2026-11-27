@@ -28,4 +28,10 @@ export class UpdateAiConfigDto {
   @Max(168)
   @IsOptional()
   aiContextHours?: number;
+
+  @IsInt()
+  @Min(0)
+  @Max(300)
+  @IsOptional()
+  aiResponseDelaySeconds?: number;
 }

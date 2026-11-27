@@ -181,16 +181,20 @@ export class ChatService {
       });
     }
 
-    // 7. Si la conversación está en manos del Bot IA, procesar triaje automático con el agente asignado
+    // 7. Si la conversación está en manos del Bot IA, programar triaje/respuesta sin bloquear el webhook de Meta
     if (conversation.status === ConversationStatus.BOT_HANDLING) {
-      this.logger.log(`Invocando triaje de IA para conversación ${conversation.id}...`);
-      await this.aiSupportService.processCustomerMessage({
-        tenantId,
-        agentId: conversation.agentId ?? targetAgentId,
-        conversationId: conversation.id,
-        customerId: customer.id,
-        messageText: text,
-      });
+      this.logger.log(`Programando respuesta IA en paralelo para conversación ${conversation.id}...`);
+      void this.aiSupportService
+        .scheduleCustomerMessage({
+          tenantId,
+          agentId: conversation.agentId ?? targetAgentId,
+          conversationId: conversation.id,
+          customerId: customer.id,
+          messageText: text,
+        })
+        .catch((err) => {
+          this.logger.error(`Error programando respuesta IA: ${err.message}`, err.stack);
+        });
     }
 
     this.logger.log(
@@ -236,6 +240,9 @@ export class ChatService {
     if (!user) {
       throw new ForbiddenException('Usuario operador no encontrado');
     }
+
+    // Cancelar respuesta IA pendiente si un operador responde manualmente antes de cumplirse el delay
+    this.aiSupportService.cancelPendingReply(conversation.id);
 
     // 3. Despachar a Meta Cloud API usando la línea/agente dueño de la conversación
     const result = await this.metaCloudApiService.sendTextMessage({
@@ -430,6 +437,8 @@ export class ChatService {
       throw new NotFoundException('Conversación no encontrada');
     }
 
+    this.aiSupportService.cancelPendingReply(conversationId);
+
     const updated = await this.prisma.conversation.update({
       where: { id: conversationId },
       data: {
@@ -484,6 +493,8 @@ export class ChatService {
     if (!conversation || conversation.tenantId !== tenantId) {
       throw new NotFoundException('Conversación no encontrada');
     }
+
+    this.aiSupportService.cancelPendingReply(conversationId);
 
     const updated = await this.prisma.conversation.update({
       where: { id: conversationId },

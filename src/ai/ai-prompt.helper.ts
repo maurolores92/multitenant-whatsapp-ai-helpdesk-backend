@@ -48,7 +48,10 @@ ESCALATION_JSON:{"shouldEscalate":true,"reason":"Resumen corto del motivo","tick
  * Construye las instrucciones oficiales de la compañía configuradas por el SuperAdmin.
  * Se comparte entre WhatsApp en vivo y el Simulador para garantizar paridad 1:1.
  */
-export function buildTenantAiSystemInstructions(tenant: TenantAiPromptContext): string {
+export function buildTenantAiSystemInstructions(
+  tenant: TenantAiPromptContext,
+  options?: { latestMessage?: string },
+): string {
   const sections: string[] = [];
 
   sections.push(
@@ -66,7 +69,27 @@ export function buildTenantAiSystemInstructions(tenant: TenantAiPromptContext): 
   }
 
   if (tenant.aiKnowledgeItems.length > 0) {
-    const kbLines = tenant.aiKnowledgeItems.map((kb) => `P: ${kb.question}\nR: ${kb.answer}`);
+    let selectedKb = tenant.aiKnowledgeItems;
+    if (selectedKb.length > 15 && options?.latestMessage) {
+      const tokens = options.latestMessage
+        .toLowerCase()
+        .split(/[^a-záéíóúüñ0-9]+/i)
+        .filter((t) => t.length >= 3);
+      if (tokens.length > 0) {
+        selectedKb = [...selectedKb]
+          .sort((a, b) => {
+            const textA = `${a.question} ${a.answer}`.toLowerCase();
+            const textB = `${b.question} ${b.answer}`.toLowerCase();
+            const scoreA = tokens.reduce((acc, tk) => (textA.includes(tk) ? acc + 1 : acc), 0);
+            const scoreB = tokens.reduce((acc, tk) => (textB.includes(tk) ? acc + 1 : acc), 0);
+            return scoreB - scoreA;
+          })
+          .slice(0, 15);
+      } else {
+        selectedKb = selectedKb.slice(0, 15);
+      }
+    }
+    const kbLines = selectedKb.map((kb) => `P: ${kb.question}\nR: ${kb.answer}`);
     sections.push(`BASE DE CONOCIMIENTOS OFICIAL:\n${kbLines.join('\n')}`);
   }
 
@@ -78,9 +101,11 @@ export function buildTenantAiSystemInstructions(tenant: TenantAiPromptContext): 
   }
 
   if (tenant.problemTypes && tenant.problemTypes.length > 0) {
-    const problemLines = tenant.problemTypes.map(
-      (pt) =>
-        `- [ID: ${pt.id}] ${pt.name}${pt.description ? `: ${pt.description}` : ''} (Categoría: ${pt.defaultReason}, Modalidad sugerida: ${pt.defaultServiceType})`,
+    const compact = tenant.problemTypes.length > 20;
+    const problemLines = tenant.problemTypes.map((pt) =>
+      compact
+        ? `- [ID: ${pt.id}] ${pt.name} (${pt.defaultReason} / ${pt.defaultServiceType})`
+        : `- [ID: ${pt.id}] ${pt.name}${pt.description ? `: ${pt.description}` : ''} (Categoría: ${pt.defaultReason}, Modalidad sugerida: ${pt.defaultServiceType})`,
     );
     sections.push(`CATÁLOGO DE PROBLEMAS DEL ERP:\n${problemLines.join('\n')}`);
   }
@@ -94,7 +119,19 @@ export function buildTenantAiSystemInstructions(tenant: TenantAiPromptContext): 
 export function buildCustomerConversationContext(params: {
   customerName: string;
   customerExternalCode?: string | null;
-  equipments: Pick<Equipment, 'id' | 'name' | 'brand' | 'model' | 'serialNumber' | 'externalCode' | 'clientCode'>[];
+  equipments: Array<{
+    id: string;
+    name: string;
+    brand?: string | null;
+    model?: string | null;
+    serialNumber?: string | null;
+    externalCode?: string | null;
+    internalCode?: string | null;
+    clientCode?: string | null;
+    codClient?: string | null;
+    customerCompanyName?: string | null;
+    customerName?: string | null;
+  }>;
   recentMessages: Pick<Message, 'senderType' | 'content'>[];
   latestMessage: string;
 }): string {
@@ -105,7 +142,7 @@ export function buildCustomerConversationContext(params: {
       ? equipments
           .map(
             (eq) =>
-              `- [ID: ${eq.id}] ${eq.name} (Cod. ERP: ${eq.externalCode || 'N/A'}, codClient: ${eq.clientCode || 'N/A'}, Marca: ${eq.brand || 'N/A'}, Modelo: ${eq.model || 'N/A'}, S/N: ${eq.serialNumber || 'N/A'})`,
+              `- [ID: ${eq.id}] ${eq.name} (N°/Cod. máquina: ${eq.internalCode || eq.externalCode || 'N/A'}, codClient: ${eq.codClient || eq.clientCode || 'N/A'}, Cliente dueño: ${eq.customerCompanyName || eq.customerName || 'N/A'}, Marca: ${eq.brand || 'N/A'}, Modelo: ${eq.model || 'N/A'}, S/N: ${eq.serialNumber || 'N/A'})`,
           )
           .join('\n')
       : 'Pendiente: aún no se identificó el equipo. Solicita el ID/código/serie del equipo y usa la herramienta buscar_equipo_por_id.';
@@ -118,7 +155,7 @@ export function buildCustomerConversationContext(params: {
   };
 
   const historyLines = recentMessages
-    .slice(-8)
+    .slice(-20)
     .map((m) => `${senderLabel[m.senderType] || m.senderType}: ${m.content}`);
 
   const clientHeader = customerExternalCode
@@ -376,6 +413,47 @@ export async function findEquipmentAndClientByCode(
 }
 
 /**
+ * Pre-consulta códigos/IDs candidatos en el mensaje del cliente antes de llamar a Gemini
+ * para evitar la segunda ida de tool-calling cuando el código ya viene explícito.
+ */
+export async function prelookupEquipmentsFromTexts(
+  prisma: PrismaService,
+  tenantId: string,
+  texts: string[],
+) {
+  const joined = texts.filter(Boolean).join(' ');
+  const rawTokens = joined.match(/#?[A-Za-z0-9][A-Za-z0-9-]{2,15}/g) || [];
+
+  // Priorizar tokens numéricos o alfanuméricos con al menos un dígito (evitar palabras comunes)
+  const candidates = Array.from(
+    new Set(
+      rawTokens
+        .map((t) => t.replace(/^#/, '').trim())
+        .filter((t) => /\d/.test(t) && t.length >= 2 && t.length <= 15),
+    ),
+  ).slice(0, 4);
+
+  if (candidates.length === 0) {
+    return [];
+  }
+
+  const results = await Promise.all(
+    candidates.map((code) => findEquipmentAndClientByCode(prisma, tenantId, code)),
+  );
+
+  const byId = new Map<string, (typeof results)[number]['matches'][number]>();
+  for (const res of results) {
+    for (const match of res.matches) {
+      if (!byId.has(match.equipmentId)) {
+        byId.set(match.equipmentId, match);
+      }
+    }
+  }
+
+  return Array.from(byId.values()).slice(0, 5);
+}
+
+/**
  * Ejecuta Gemini habilitando la herramienta buscar_equipo_por_id para consultar máquinas y su cliente (codClient).
  */
 export async function generateGeminiWithEquipmentTools(params: {
@@ -386,30 +464,60 @@ export async function generateGeminiWithEquipmentTools(params: {
   systemInstruction: string;
   userContext: string;
   temperature: number;
+  initialMatchedEquipmentId?: string;
+  initialMatchedCustomerId?: string;
 }): Promise<{
   text: string;
   modelUsed: string;
   matchedEquipmentId?: string;
   matchedCustomerId?: string;
 }> {
-  const { client, prisma, tenantId, preferredModel, systemInstruction, userContext, temperature } = params;
+  const {
+    client,
+    prisma,
+    tenantId,
+    preferredModel,
+    systemInstruction,
+    userContext,
+    temperature,
+    initialMatchedEquipmentId,
+    initialMatchedCustomerId,
+  } = params;
   const contents: Content[] = [{ role: 'user', parts: [{ text: userContext }] }];
   let lastModelUsed = preferredModel;
-  let matchedEquipmentId: string | undefined;
-  let matchedCustomerId: string | undefined;
+  let matchedEquipmentId: string | undefined = initialMatchedEquipmentId;
+  let matchedCustomerId: string | undefined = initialMatchedCustomerId;
 
-  for (let round = 0; round < 3; round++) {
-    const { result: response, modelUsed } = await generateGeminiWithFallback(preferredModel, (model) =>
-      client.models.generateContent({
+  const callModel = async (model: string) => {
+    try {
+      return await client.models.generateContent({
         model,
         contents,
         config: {
           systemInstruction,
           temperature,
+          thinkingConfig: { thinkingBudget: 0 },
           tools: [{ functionDeclarations: [LOOKUP_EQUIPMENT_TOOL] }],
         },
-      }),
-    );
+      });
+    } catch (err: any) {
+      if (err?.status === 400 || String(err?.message || '').toLowerCase().includes('thinking')) {
+        return client.models.generateContent({
+          model,
+          contents,
+          config: {
+            systemInstruction,
+            temperature,
+            tools: [{ functionDeclarations: [LOOKUP_EQUIPMENT_TOOL] }],
+          },
+        });
+      }
+      throw err;
+    }
+  };
+
+  for (let round = 0; round < 3; round++) {
+    const { result: response, modelUsed } = await generateGeminiWithFallback(preferredModel, callModel);
     lastModelUsed = modelUsed;
 
     const functionCalls = response.functionCalls;

@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { GoogleGenAI } from '@google/genai';
 import { PrismaService } from '../prisma/prisma.service';
@@ -21,14 +21,42 @@ import {
   findEquipmentAndClientByCode,
   generateGeminiWithEquipmentTools,
   parseEscalationOutput,
+  prelookupEquipmentsFromTexts,
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
 } from './ai-prompt.helper';
 import { resolveTenantAgent } from '../agents/agents.helper';
 
+interface PreparedCustomerReply {
+  tenantId: string;
+  agentId?: string;
+  conversationId: string;
+  customer: { id: string; name: string; phone: string };
+  replyText: string;
+  shouldEscalate: boolean;
+  escalationData?: {
+    reason: string;
+    ticketReason: TicketReason;
+    problemTypeId?: string;
+    serviceType: ServiceType;
+    priority: TicketPriority;
+    diagnosticSummary: string;
+    equipmentId?: string;
+    resolvedCustomerId?: string;
+  };
+}
+
+interface PendingReplyEntry {
+  seq: number;
+  timer: NodeJS.Timeout;
+  readyPromise: Promise<PreparedCustomerReply | null>;
+}
+
 @Injectable()
-export class AiSupportService {
+export class AiSupportService implements OnModuleDestroy {
   private readonly logger = new Logger(AiSupportService.name);
+  private readonly pendingReplies = new Map<string, PendingReplyEntry>();
+  private seqCounter = 0;
 
   constructor(
     private readonly configService: ConfigService,
@@ -39,9 +67,95 @@ export class AiSupportService {
     private readonly metaCloudApiService: MetaCloudApiService,
   ) {}
 
+  onModuleDestroy() {
+    for (const entry of this.pendingReplies.values()) {
+      clearTimeout(entry.timer);
+    }
+    this.pendingReplies.clear();
+  }
+
   /**
-   * Procesa un mensaje entrante cuando la conversación está en BOT_HANDLING.
-   * Usa la configuración y entrenamiento específicos del WhatsAppAgent que recibió el mensaje.
+   * Cancela cualquier respuesta IA pendiente de envío (p. ej. si un operador humano respondió antes).
+   */
+  cancelPendingReply(conversationId: string) {
+    const existing = this.pendingReplies.get(conversationId);
+    if (existing) {
+      clearTimeout(existing.timer);
+      this.pendingReplies.delete(conversationId);
+      this.logger.log(`Envío IA pendiente cancelado para conversación ${conversationId}`);
+    }
+  }
+
+  /**
+   * Programa la respuesta de IA con retardo controlado (por defecto 60s en Servicio Técnico):
+   * prepara la respuesta inmediatamente en segundo plano y la envía al cumplirse el minuto.
+   */
+  async scheduleCustomerMessage(params: {
+    tenantId: string;
+    agentId?: string;
+    conversationId: string;
+    customerId: string;
+    messageText: string;
+  }) {
+    const { tenantId, agentId, conversationId } = params;
+    const resolvedAgent = await resolveTenantAgent(this.prisma, tenantId, { agentId });
+    const isTechnicalService = resolvedAgent?.area === 'TECHNICAL_SERVICE';
+    const delaySeconds = isTechnicalService ? (resolvedAgent?.aiResponseDelaySeconds ?? 60) : 0;
+
+    if (delaySeconds <= 0) {
+      return this.processCustomerMessage(params);
+    }
+
+    // Cancelar envío pendiente previo (debounce si el cliente escribe en varios mensajes seguidos)
+    this.cancelPendingReply(conversationId);
+    const seq = ++this.seqCounter;
+
+    // Comenzar a preparar la respuesta INMEDIATAMENTE en segundo plano
+    const readyPromise = this.prepareCustomerReply(params).catch((err) => {
+      this.logger.error(
+        `Error preparando respuesta IA anticipada para ${conversationId}: ${err.message}`,
+        err.stack,
+      );
+      return null;
+    });
+
+    const timer = setTimeout(async () => {
+      const current = this.pendingReplies.get(conversationId);
+      if (!current || current.seq !== seq) return;
+      this.pendingReplies.delete(conversationId);
+
+      try {
+        const conv = await this.prisma.conversation.findUnique({
+          where: { id: conversationId },
+          select: { status: true },
+        });
+        if (!conv || conv.status !== ConversationStatus.BOT_HANDLING) {
+          this.logger.log(
+            `Conversación ${conversationId} ya pasó a estado ${conv?.status}; se omite envío automático IA.`,
+          );
+          return;
+        }
+
+        const prepared = await readyPromise;
+        if (!prepared) return;
+
+        await this.dispatchPreparedReply(prepared);
+      } catch (err: any) {
+        this.logger.error(
+          `Error enviando respuesta programada para ${conversationId}: ${err.message}`,
+          err.stack,
+        );
+      }
+    }, delaySeconds * 1000);
+
+    this.pendingReplies.set(conversationId, { seq, timer, readyPromise });
+    this.logger.log(
+      `Respuesta IA iniciada en paralelo para ${conversationId}; envío programado en ${delaySeconds}s.`,
+    );
+  }
+
+  /**
+   * Procesa y envía inmediatamente (usado cuando aiResponseDelaySeconds = 0 o llamado directo).
    */
   async processCustomerMessage(params: {
     tenantId: string;
@@ -50,6 +164,21 @@ export class AiSupportService {
     customerId: string;
     messageText: string;
   }) {
+    const prepared = await this.prepareCustomerReply(params);
+    if (!prepared) return;
+    return this.dispatchPreparedReply(prepared);
+  }
+
+  /**
+   * Prepara el diagnóstico y texto de respuesta consultando BD + Gemini sin esperar al envío.
+   */
+  private async prepareCustomerReply(params: {
+    tenantId: string;
+    agentId?: string;
+    conversationId: string;
+    customerId: string;
+    messageText: string;
+  }): Promise<PreparedCustomerReply | null> {
     const { tenantId, agentId, conversationId, customerId, messageText } = params;
 
     const resolvedAgent = await resolveTenantAgent(this.prisma, tenantId, { agentId });
@@ -93,7 +222,7 @@ export class AiSupportService {
       }),
     ]);
 
-    if (!customer || !tenant) return;
+    if (!customer || !tenant) return null;
 
     const effectiveAi = agentWithTraining
       ? {
@@ -112,7 +241,7 @@ export class AiSupportService {
         }
       : tenant;
 
-    // Si la IA del agente está desactivada, deriva directo a cola humana
+    // Si la IA del agente está desactivada, deriva directo a cola humana de inmediato
     if (!effectiveAi.aiEnabled) {
       await this.prisma.conversation.update({
         where: { id: conversationId },
@@ -131,7 +260,7 @@ export class AiSupportService {
         conversationId,
         status: ConversationStatus.WAITING_AGENT,
       });
-      return;
+      return null;
     }
 
     const orderedHistory = [...recentMessages].reverse();
@@ -143,10 +272,28 @@ export class AiSupportService {
       latestMessage: messageText,
     });
 
+    return {
+      tenantId,
+      agentId: agentWithTraining?.id,
+      conversationId,
+      customer: {
+        id: customer.id,
+        name: customer.name,
+        phone: customer.phone,
+      },
+      replyText,
+      shouldEscalate,
+      escalationData,
+    };
+  }
+
+  private async dispatchPreparedReply(prepared: PreparedCustomerReply) {
+    const { tenantId, agentId, conversationId, customer, replyText, shouldEscalate, escalationData } = prepared;
+
     if (shouldEscalate && escalationData) {
       await this.escalateToHuman({
         tenantId,
-        agentId: agentWithTraining?.id,
+        agentId,
         conversationId,
         customerId: escalationData.resolvedCustomerId || customer.id,
         reason: escalationData.reason,
@@ -175,7 +322,7 @@ export class AiSupportService {
 
     await this.metaCloudApiService.sendTextMessage({
       tenantId,
-      agentId: agentWithTraining?.id,
+      agentId,
       to: customer.phone,
       text: replyText,
     });
@@ -226,11 +373,33 @@ export class AiSupportService {
     if (apiKey && apiKey !== 'your-gemini-api-key') {
       try {
         const client = new GoogleGenAI({ apiKey });
-        const systemInstructions = `${buildTenantAiSystemInstructions(tenant)}\n\n${TICKET_ESCALATION_PROTOCOL}`;
+        const customerHistoryTexts = recentMessages
+          .filter((m) => m.senderType === SenderType.CUSTOMER)
+          .slice(-3)
+          .map((m) => m.content);
+        const prematched = await prelookupEquipmentsFromTexts(this.prisma, tenant.id, [
+          latestMessage,
+          ...customerHistoryTexts,
+        ]);
+        const uniquePreMatch = prematched.length === 1 ? prematched[0] : undefined;
+
+        const systemInstructions = `${buildTenantAiSystemInstructions(tenant, { latestMessage })}\n\n${TICKET_ESCALATION_PROTOCOL}`;
         const userContext = buildCustomerConversationContext({
-          customerName: customer.name,
-          customerExternalCode: customer.externalCode,
-          equipments: [],
+          customerName: uniquePreMatch?.customer?.name || customer.name,
+          customerExternalCode:
+            uniquePreMatch?.codClient || uniquePreMatch?.customer?.externalCode || customer.externalCode,
+          equipments: prematched.map((m) => ({
+            id: m.equipmentId,
+            name: m.name,
+            brand: m.brand,
+            model: m.model,
+            serialNumber: m.serialNumber,
+            externalCode: m.externalCode,
+            internalCode: m.internalCode,
+            codClient: m.codClient,
+            customerCompanyName: m.customer?.companyName || null,
+            customerName: m.customer?.name || null,
+          })),
           recentMessages,
           latestMessage,
         });
@@ -248,6 +417,8 @@ export class AiSupportService {
           systemInstruction: systemInstructions,
           userContext,
           temperature: tenant.aiTemperature ?? 0.2,
+          initialMatchedEquipmentId: uniquePreMatch?.equipmentId,
+          initialMatchedCustomerId: uniquePreMatch?.customer?.customerId,
         });
         if (modelUsed !== geminiModel) {
           this.logger.warn(
