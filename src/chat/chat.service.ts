@@ -103,6 +103,35 @@ export class ChatService {
       orderBy: { updatedAt: 'desc' },
     });
 
+    // Opción A (solo para Servicio Técnico): si la conversación estaba siendo atendida por la IA
+    // (BOT_HANDLING) y superó la ventana configurada (24 h), cerrarla y reiniciar una nueva.
+    // Si estaba en WAITING_AGENT / AGENT_HANDLING, se conserva abierta para el técnico.
+    if (
+      conversation &&
+      conversation.status === ConversationStatus.BOT_HANDLING &&
+      resolvedAgent?.area === AgentArea.TECHNICAL_SERVICE
+    ) {
+      const contextHours = resolvedAgent.aiContextHours ?? 24;
+      const elapsedMs = Date.now() - new Date(conversation.lastMessageAt).getTime();
+      if (elapsedMs > contextHours * 60 * 60 * 1000) {
+        await this.prisma.conversation.update({
+          where: { id: conversation.id },
+          data: { status: ConversationStatus.RESOLVED },
+        });
+        await this.auditService.log({
+          tenantId,
+          action: 'CONVERSATION_AUTO_RESOLVED_24H',
+          entity: 'Conversation',
+          entityId: conversation.id,
+          payload: { contextHours, reason: 'Inactividad mayor a ventana de memoria IA (Servicio Técnico)' },
+        });
+        this.logger.log(
+          `Conversación ${conversation.id} cerrada automáticamente por superar ${contextHours}h sin actividad; iniciando sesión nueva para IA.`,
+        );
+        conversation = null;
+      }
+    }
+
     if (!conversation) {
       conversation = await this.prisma.conversation.create({
         data: {

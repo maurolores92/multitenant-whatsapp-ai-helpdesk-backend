@@ -177,6 +177,7 @@ model WhatsAppAgent {
   aiTemperature         Float           @default(0.2)
   aiSystemPrompt        String?         @db.Text
   aiEnabled             Boolean         @default(true)
+  aiContextHours        Int             @default(24) // Ventana de memoria para Servicio Técnico (horas)
 
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt

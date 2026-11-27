@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsNumber, IsBoolean, Min, Max } from 'class-validator';
+import { IsString, IsOptional, IsNumber, IsBoolean, IsInt, Min, Max } from 'class-validator';
 
 export class UpdateAiConfigDto {
   @IsString()
@@ -22,4 +22,10 @@ export class UpdateAiConfigDto {
   @IsBoolean()
   @IsOptional()
   aiEnabled?: boolean;
+
+  @IsInt()
+  @Min(1)
+  @Max(168)
+  @IsOptional()
+  aiContextHours?: number;
 }

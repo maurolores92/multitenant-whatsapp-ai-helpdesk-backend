@@ -53,6 +53,11 @@ export class AiSupportService {
     const { tenantId, agentId, conversationId, customerId, messageText } = params;
 
     const resolvedAgent = await resolveTenantAgent(this.prisma, tenantId, { agentId });
+    const isTechnicalService = resolvedAgent?.area === 'TECHNICAL_SERVICE';
+    const contextHours = resolvedAgent?.aiContextHours ?? 24;
+    const messageSince = isTechnicalService
+      ? new Date(Date.now() - contextHours * 60 * 60 * 1000)
+      : undefined;
 
     const [customer, tenant, agentWithTraining, recentMessages] = await Promise.all([
       this.prisma.customer.findUnique({
@@ -79,9 +84,12 @@ export class AiSupportService {
           })
         : Promise.resolve(null),
       this.prisma.message.findMany({
-        where: { conversationId },
+        where: {
+          conversationId,
+          ...(messageSince ? { createdAt: { gte: messageSince } } : {}),
+        },
         orderBy: { createdAt: 'desc' },
-        take: 8,
+        take: isTechnicalService ? 20 : 8,
       }),
     ]);
 

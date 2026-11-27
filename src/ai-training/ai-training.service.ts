@@ -10,8 +10,8 @@ import { AuditService } from '../audit/audit.service';
 import { UpdateAiConfigDto } from './dto/update-ai-config.dto';
 import { CreateAiRuleDto, UpdateAiRuleDto } from './dto/ai-rule.dto';
 import { CreateAiKnowledgeDto, UpdateAiKnowledgeDto } from './dto/ai-knowledge.dto';
-import { CreateAiExampleDto } from './dto/ai-example.dto';
-import { AgentArea } from '@prisma/client';
+import { CreateAiExampleDto, SimulateMessageItemDto } from './dto/ai-example.dto';
+import { AgentArea, SenderType } from '@prisma/client';
 import {
   buildCustomerConversationContext,
   buildTenantAiSystemInstructions,
@@ -82,6 +82,7 @@ export class AiTrainingService {
       aiTemperature: agent.aiTemperature ?? tenant.aiTemperature,
       aiSystemPrompt: agent.aiSystemPrompt ?? tenant.aiSystemPrompt,
       aiEnabled: agent.aiEnabled,
+      aiContextHours: agent.aiContextHours ?? 24,
       hasCustomApiKey,
       maskedApiKey,
       counts: {
@@ -130,6 +131,9 @@ export class AiTrainingService {
     if (dto.aiEnabled !== undefined) {
       updateData.aiEnabled = dto.aiEnabled;
     }
+    if (dto.aiContextHours !== undefined) {
+      updateData.aiContextHours = dto.aiContextHours;
+    }
 
     const updated = await this.prisma.whatsAppAgent.update({
       where: { id: agent.id },
@@ -137,10 +141,13 @@ export class AiTrainingService {
     });
 
     if (updated.isDefault) {
-      await this.prisma.tenant.update({
-        where: { id: tenantId },
-        data: updateData,
-      });
+      const { aiContextHours: _ignoredTenantField, ...tenantMirrorData } = updateData;
+      if (Object.keys(tenantMirrorData).length > 0) {
+        await this.prisma.tenant.update({
+          where: { id: tenantId },
+          data: tenantMirrorData,
+        });
+      }
     }
 
     await this.auditService.log({
@@ -421,9 +428,15 @@ export class AiTrainingService {
   // ========================================================
 
   /**
-   * Ejecuta una simulación con el motor de Google Gemini inyectando las reglas activas del agente
+   * Ejecuta una simulación con el motor de Google Gemini inyectando las reglas activas del agente.
+   * Para Servicio Técnico soporta historial multi-turno limitado a la ventana configurada (24 h).
    */
-  async simulate(tenantId: string, message: string, scope?: AgentScopeOptions) {
+  async simulate(
+    tenantId: string,
+    message: string,
+    scope?: AgentScopeOptions,
+    history: SimulateMessageItemDto[] = [],
+  ) {
     const startTime = Date.now();
 
     const tenant = await this.prisma.tenant.findUnique({
@@ -469,6 +482,24 @@ export class AiTrainingService {
       problemTypes: tenant.problemTypes,
     };
 
+    const isTechnicalService = agent?.area === AgentArea.TECHNICAL_SERVICE;
+    const contextHours = agent?.aiContextHours ?? 24;
+    const cutoffMs = Date.now() - contextHours * 60 * 60 * 1000;
+
+    const recentMessages = isTechnicalService
+      ? history
+          .filter((item) => {
+            if (!item.timestamp) return true;
+            const parsedTime = Date.parse(item.timestamp);
+            return Number.isNaN(parsedTime) || parsedTime >= cutoffMs;
+          })
+          .slice(-20)
+          .map((item) => ({
+            senderType: item.sender === 'user' ? SenderType.CUSTOMER : SenderType.BOT,
+            content: item.text,
+          }))
+      : [];
+
     // Determinar API Key de Gemini: prioriza la del agente/tenant, con fallback a la del sistema
     const apiKey =
       agent?.geminiApiKey?.trim() ||
@@ -484,6 +515,8 @@ export class AiTrainingService {
 
     let responseText = '';
     let isLiveAi = false;
+    let matchedEquipmentSummary: { id: string; name: string; code: string | null; customerName: string | null } | null =
+      null;
 
     if (apiKey && apiKey !== 'your-gemini-api-key') {
       try {
@@ -491,10 +524,10 @@ export class AiTrainingService {
         const userContext = buildCustomerConversationContext({
           customerName: 'Cliente Simulador',
           equipments: [],
-          recentMessages: [],
+          recentMessages,
           latestMessage: message,
         });
-        const { text: rawText, modelUsed } = await generateGeminiWithEquipmentTools({
+        const { text: rawText, modelUsed, matchedEquipmentId } = await generateGeminiWithEquipmentTools({
           client,
           prisma: this.prisma,
           tenantId: tenant.id,
@@ -504,6 +537,23 @@ export class AiTrainingService {
           temperature,
         });
         model = modelUsed;
+        if (matchedEquipmentId) {
+          const eq = await this.prisma.equipment.findUnique({
+            where: { id: matchedEquipmentId },
+            include: { customer: { select: { name: true, companyName: true } } },
+          });
+          if (eq) {
+            const specs = (eq.specifications && typeof eq.specifications === 'object'
+              ? eq.specifications
+              : {}) as Record<string, any>;
+            matchedEquipmentSummary = {
+              id: eq.id,
+              name: eq.name,
+              code: specs.internalCode ? String(specs.internalCode) : eq.externalCode,
+              customerName: eq.customer?.companyName || eq.customer?.name || null,
+            };
+          }
+        }
         const parsed = parseEscalationOutput(rawText);
         responseText = parsed.escalationPayload
           ? `${parsed.replyText}\n\n[Simulación de Ticket IA]: ${JSON.stringify(parsed.escalationPayload)}`
@@ -524,6 +574,9 @@ export class AiTrainingService {
       modelUsed: model,
       aiEnabled,
       isLiveAi,
+      contextHours: isTechnicalService ? contextHours : null,
+      historyMessagesUsed: recentMessages.length,
+      matchedEquipment: matchedEquipmentSummary,
       rulesCount: effectiveContext.aiRules.length,
       knowledgeCount: effectiveContext.aiKnowledgeItems.length,
       examplesCount: effectiveContext.aiTrainingExamples.length,
