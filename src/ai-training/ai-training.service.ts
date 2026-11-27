@@ -13,7 +13,7 @@ import { CreateAiKnowledgeDto, UpdateAiKnowledgeDto } from './dto/ai-knowledge.d
 import { CreateAiExampleDto } from './dto/ai-example.dto';
 import {
   buildTenantAiSystemInstructions,
-  callGeminiWithRetry,
+  generateGeminiWithFallback,
   parseEscalationOutput,
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
@@ -399,7 +399,7 @@ export class AiTrainingService {
 
     // Determinar API Key de Gemini: prioriza la del tenant, con fallback a la del sistema
     const apiKey = tenant.geminiApiKey?.trim() || this.configService.get<string>('GEMINI_API_KEY');
-    const model = resolveGeminiModel(
+    let model = resolveGeminiModel(
       tenant.geminiModel,
       this.configService.get<string>('GEMINI_MODEL'),
     );
@@ -411,9 +411,9 @@ export class AiTrainingService {
     if (apiKey && apiKey !== 'your-gemini-api-key') {
       try {
         const client = new GoogleGenAI({ apiKey });
-        const res = await callGeminiWithRetry(() =>
+        const { result: res, modelUsed } = await generateGeminiWithFallback(model, (targetModel) =>
           client.models.generateContent({
-            model,
+            model: targetModel,
             contents: `Mensaje recibido del cliente en el simulador:\n"${message}"`,
             config: {
               systemInstruction: systemInstructions,
@@ -421,6 +421,7 @@ export class AiTrainingService {
             },
           }),
         );
+        model = modelUsed;
         const parsed = parseEscalationOutput(res.text || '');
         responseText = parsed.escalationPayload
           ? `${parsed.replyText}\n\n[Simulación de Ticket IA]: ${JSON.stringify(parsed.escalationPayload)}`

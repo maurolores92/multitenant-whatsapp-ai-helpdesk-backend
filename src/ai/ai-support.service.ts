@@ -18,7 +18,7 @@ import {
 import {
   buildCustomerConversationContext,
   buildTenantAiSystemInstructions,
-  callGeminiWithRetry,
+  generateGeminiWithFallback,
   parseEscalationOutput,
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
@@ -191,16 +191,23 @@ export class AiSupportService {
           latestMessage,
         });
 
-        const response = await callGeminiWithRetry(() =>
-          client.models.generateContent({
-            model: geminiModel,
-            contents: userContext,
-            config: {
-              systemInstruction: systemInstructions,
-              temperature: tenant.aiTemperature ?? 0.2,
-            },
-          }),
+        const { result: response, modelUsed } = await generateGeminiWithFallback(
+          geminiModel,
+          (model) =>
+            client.models.generateContent({
+              model,
+              contents: userContext,
+              config: {
+                systemInstruction: systemInstructions,
+                temperature: tenant.aiTemperature ?? 0.2,
+              },
+            }),
         );
+        if (modelUsed !== geminiModel) {
+          this.logger.warn(
+            `Gemini fallback activado para '${tenant.name}': ${geminiModel} saturado -> respondido con ${modelUsed}`,
+          );
+        }
 
         const { replyText, escalationPayload } = parseEscalationOutput(response.text || '');
 

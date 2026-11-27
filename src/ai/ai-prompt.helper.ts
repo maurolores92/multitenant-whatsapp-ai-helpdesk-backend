@@ -148,6 +148,7 @@ export function parseEscalationOutput(rawText: string): {
 }
 
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+export const FALLBACK_GEMINI_MODEL = 'gemini-3.5-flash-lite';
 
 const DEPRECATED_GEMINI_MODELS = new Set([
   'gemini-2.0-flash',
@@ -172,12 +173,23 @@ export function resolveGeminiModel(
   return DEFAULT_GEMINI_MODEL;
 }
 
+function isTransientGeminiError(err: any): boolean {
+  const msg = String(err?.message || '');
+  return (
+    err?.status === 503 ||
+    err?.status === 429 ||
+    msg.includes('"code":503') ||
+    msg.includes('"code":429') ||
+    msg.includes('UNAVAILABLE')
+  );
+}
+
 /**
  * Ejecuta una llamada a Gemini con reintentos breves ante picos temporales de demanda (503 / 429).
  */
 export async function callGeminiWithRetry<T>(
   fn: () => Promise<T>,
-  maxRetries = 2,
+  maxRetries = 1,
   baseDelayMs = 1200,
 ): Promise<T> {
   let lastError: any;
@@ -186,18 +198,31 @@ export async function callGeminiWithRetry<T>(
       return await fn();
     } catch (err: any) {
       lastError = err;
-      const msg = String(err?.message || '');
-      const isTransient =
-        err?.status === 503 ||
-        err?.status === 429 ||
-        msg.includes('"code":503') ||
-        msg.includes('"code":429') ||
-        msg.includes('UNAVAILABLE');
-      if (!isTransient || attempt === maxRetries) {
+      if (!isTransientGeminiError(err) || attempt === maxRetries) {
         throw err;
       }
       await new Promise((resolve) => setTimeout(resolve, baseDelayMs * (attempt + 1)));
     }
   }
   throw lastError;
+}
+
+/**
+ * Ejecuta Gemini probando el modelo principal y haciendo fallback a gemini-3.5-flash-lite
+ * si el modelo principal responde saturación temporal (503 / 429).
+ */
+export async function generateGeminiWithFallback<T>(
+  primaryModel: string,
+  invoke: (model: string) => Promise<T>,
+): Promise<{ result: T; modelUsed: string }> {
+  try {
+    const result = await callGeminiWithRetry(() => invoke(primaryModel), 1, 1000);
+    return { result, modelUsed: primaryModel };
+  } catch (err: any) {
+    if (!isTransientGeminiError(err) || primaryModel === FALLBACK_GEMINI_MODEL) {
+      throw err;
+    }
+    const result = await callGeminiWithRetry(() => invoke(FALLBACK_GEMINI_MODEL), 1, 1000);
+    return { result, modelUsed: FALLBACK_GEMINI_MODEL };
+  }
 }
