@@ -1,8 +1,31 @@
 services:
   postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - whatsapp_ia_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   backend:
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "${PORT:-5000}:${PORT:-5000}"
+
+networks:
+  coolify:
+    external: false
+
+volumes:
+  whatsapp_ia_pgdata:
