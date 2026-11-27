@@ -18,7 +18,8 @@ import {
 import {
   buildCustomerConversationContext,
   buildTenantAiSystemInstructions,
-  generateGeminiWithFallback,
+  findEquipmentAndClientByCode,
+  generateGeminiWithEquipmentTools,
   parseEscalationOutput,
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
@@ -107,7 +108,7 @@ export class AiSupportService {
       await this.escalateToHuman({
         tenantId,
         conversationId,
-        customerId: customer.id,
+        customerId: escalationData.resolvedCustomerId || customer.id,
         reason: escalationData.reason,
         ticketReason: escalationData.ticketReason,
         problemTypeId: escalationData.problemTypeId,
@@ -170,6 +171,7 @@ export class AiSupportService {
       priority: TicketPriority;
       diagnosticSummary: string;
       equipmentId?: string;
+      resolvedCustomerId?: string;
     };
   }> {
     const { tenant, customer, recentMessages, latestMessage } = params;
@@ -186,34 +188,56 @@ export class AiSupportService {
         const systemInstructions = `${buildTenantAiSystemInstructions(tenant)}\n\n${TICKET_ESCALATION_PROTOCOL}`;
         const userContext = buildCustomerConversationContext({
           customerName: customer.name,
-          equipments: customer.equipments || [],
+          customerExternalCode: customer.externalCode,
+          equipments: [],
           recentMessages,
           latestMessage,
         });
 
-        const { result: response, modelUsed } = await generateGeminiWithFallback(
-          geminiModel,
-          (model) =>
-            client.models.generateContent({
-              model,
-              contents: userContext,
-              config: {
-                systemInstruction: systemInstructions,
-                temperature: tenant.aiTemperature ?? 0.2,
-              },
-            }),
-        );
+        const {
+          text: rawAiText,
+          modelUsed,
+          matchedEquipmentId,
+          matchedCustomerId,
+        } = await generateGeminiWithEquipmentTools({
+          client,
+          prisma: this.prisma,
+          tenantId: tenant.id,
+          preferredModel: geminiModel,
+          systemInstruction: systemInstructions,
+          userContext,
+          temperature: tenant.aiTemperature ?? 0.2,
+        });
         if (modelUsed !== geminiModel) {
           this.logger.warn(
             `Gemini fallback activado para '${tenant.name}': ${geminiModel} saturado -> respondido con ${modelUsed}`,
           );
         }
 
-        const { replyText, escalationPayload } = parseEscalationOutput(response.text || '');
+        const { replyText, escalationPayload } = parseEscalationOutput(rawAiText);
 
         if (escalationPayload?.shouldEscalate) {
           const validProblem = tenant.problemTypes?.find((pt: any) => pt.id === escalationPayload.problemTypeId);
-          const validEquipment = customer.equipments?.find((eq: any) => eq.id === escalationPayload.equipmentId);
+          const candidateEquipmentId = escalationPayload.equipmentId || matchedEquipmentId;
+          let resolvedEquipmentId: string | undefined;
+          let resolvedCustomerId: string | undefined = matchedCustomerId;
+
+          if (candidateEquipmentId) {
+            const directEquipment = await this.prisma.equipment.findFirst({
+              where: { id: candidateEquipmentId, tenantId: tenant.id },
+              select: { id: true, customerId: true },
+            });
+            if (directEquipment) {
+              resolvedEquipmentId = directEquipment.id;
+              resolvedCustomerId = directEquipment.customerId;
+            } else {
+              const byCode = await findEquipmentAndClientByCode(this.prisma, tenant.id, String(candidateEquipmentId));
+              if (byCode.matches[0]) {
+                resolvedEquipmentId = byCode.matches[0].equipmentId;
+                resolvedCustomerId = byCode.matches[0].customer?.customerId || resolvedCustomerId;
+              }
+            }
+          }
 
           return {
             replyText:
@@ -234,7 +258,8 @@ export class AiSupportService {
                 ? escalationPayload.priority
                 : TicketPriority.HIGH,
               diagnosticSummary: escalationPayload.diagnosticSummary || latestMessage,
-              equipmentId: validEquipment?.id || customer.equipments?.[0]?.id,
+              equipmentId: resolvedEquipmentId,
+              resolvedCustomerId: resolvedCustomerId || customer.id,
             },
           };
         }

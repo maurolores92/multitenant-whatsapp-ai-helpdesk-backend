@@ -12,8 +12,9 @@ import { CreateAiRuleDto, UpdateAiRuleDto } from './dto/ai-rule.dto';
 import { CreateAiKnowledgeDto, UpdateAiKnowledgeDto } from './dto/ai-knowledge.dto';
 import { CreateAiExampleDto } from './dto/ai-example.dto';
 import {
+  buildCustomerConversationContext,
   buildTenantAiSystemInstructions,
-  generateGeminiWithFallback,
+  generateGeminiWithEquipmentTools,
   parseEscalationOutput,
   resolveGeminiModel,
   TICKET_ESCALATION_PROTOCOL,
@@ -411,18 +412,23 @@ export class AiTrainingService {
     if (apiKey && apiKey !== 'your-gemini-api-key') {
       try {
         const client = new GoogleGenAI({ apiKey });
-        const { result: res, modelUsed } = await generateGeminiWithFallback(model, (targetModel) =>
-          client.models.generateContent({
-            model: targetModel,
-            contents: `Mensaje recibido del cliente en el simulador:\n"${message}"`,
-            config: {
-              systemInstruction: systemInstructions,
-              temperature: tenant.aiTemperature ?? 0.2,
-            },
-          }),
-        );
+        const userContext = buildCustomerConversationContext({
+          customerName: 'Cliente Simulador',
+          equipments: [],
+          recentMessages: [],
+          latestMessage: message,
+        });
+        const { text: rawText, modelUsed } = await generateGeminiWithEquipmentTools({
+          client,
+          prisma: this.prisma,
+          tenantId: tenant.id,
+          preferredModel: model,
+          systemInstruction: systemInstructions,
+          userContext,
+          temperature: tenant.aiTemperature ?? 0.2,
+        });
         model = modelUsed;
-        const parsed = parseEscalationOutput(res.text || '');
+        const parsed = parseEscalationOutput(rawText);
         responseText = parsed.escalationPayload
           ? `${parsed.replyText}\n\n[Simulación de Ticket IA]: ${JSON.stringify(parsed.escalationPayload)}`
           : parsed.replyText || 'No se recibió respuesta del modelo';

@@ -49,13 +49,15 @@ export class ChatService {
       return existingMessage;
     }
 
-    // 2. Buscar o crear el Cliente (Customer)
-    let customer = await this.prisma.customer.findUnique({
+    // 2. Normalizar teléfono entrante con prefijo '+' (E.164) y buscar/registrar contacto de WhatsApp
+    const digits = fromPhone.replace(/\D/g, '');
+    const normalizedPhone = digits ? `+${digits}` : fromPhone.trim();
+    const phoneCandidates = Array.from(new Set([normalizedPhone, digits, fromPhone.trim()].filter(Boolean)));
+
+    let customer = await this.prisma.customer.findFirst({
       where: {
-        tenantId_phone: {
-          tenantId,
-          phone: fromPhone,
-        },
+        tenantId,
+        phone: { in: phoneCandidates },
       },
     });
 
@@ -63,16 +65,25 @@ export class ChatService {
       customer = await this.prisma.customer.create({
         data: {
           tenantId,
-          phone: fromPhone,
-          name: customerName || `Cliente WhatsApp (${fromPhone.slice(-4)})`,
+          phone: normalizedPhone,
+          name: customerName || `Cliente WhatsApp (${digits.slice(-4) || fromPhone.slice(-4)})`,
         },
       });
-      this.logger.log(`Nuevo cliente creado para tenant ${tenantId}: ${customer.name}`);
-    } else if (customerName && customer.name.startsWith('Cliente WhatsApp')) {
-      customer = await this.prisma.customer.update({
-        where: { id: customer.id },
-        data: { name: customerName },
-      });
+      this.logger.log(`Nuevo contacto WhatsApp creado para tenant ${tenantId}: ${customer.name} (${normalizedPhone})`);
+    } else {
+      const updateData: Record<string, any> = {};
+      if (customer.phone !== normalizedPhone) {
+        updateData.phone = normalizedPhone;
+      }
+      if (customerName && customer.name.startsWith('Cliente WhatsApp')) {
+        updateData.name = customerName;
+      }
+      if (Object.keys(updateData).length > 0) {
+        customer = await this.prisma.customer.update({
+          where: { id: customer.id },
+          data: updateData,
+        });
+      }
     }
 
     // 3. Buscar conversación activa (no resuelta) o crear una nueva

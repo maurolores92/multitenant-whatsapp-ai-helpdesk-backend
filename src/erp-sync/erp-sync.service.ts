@@ -12,6 +12,7 @@ import { firstValueFrom } from 'rxjs';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { EventsGateway } from '../notifications/events.gateway';
 import { UpdateErpConfigDto } from './dto/update-erp-config.dto';
 import {
   joinErpUrl,
@@ -34,6 +35,7 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     private readonly httpService: HttpService,
     private readonly auditService: AuditService,
     private readonly notificationsService: NotificationsService,
+    private readonly eventsGateway: EventsGateway,
   ) {}
 
   onModuleInit() {
@@ -126,32 +128,32 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     return {
       config: integration
         ? {
-            ...integration,
-            hasApiKey: Boolean(integration.apiKey),
-            apiKey: integration.apiKey ? '********' : '',
-            hasPassword: Boolean(integration.password),
-            password: integration.password ? '********' : '',
-          }
+          ...integration,
+          hasApiKey: Boolean(integration.apiKey),
+          apiKey: integration.apiKey ? '********' : '',
+          hasPassword: Boolean(integration.password),
+          password: integration.password ? '********' : '',
+        }
         : {
-            tenantId,
-            baseUrl: 'https://api.helpcopies.com/api',
-            authType: ErpAuthType.BEARER_TOKEN,
-            apiKey: '',
-            hasApiKey: false,
-            apiKeyHeader: 'x-api-key',
-            loginEndpoint: '/auth/login',
-            username: '',
-            password: '',
-            hasPassword: false,
-            customersEndpoint: '/clients',
-            equipmentsEndpoint: '/machines',
-            problemsEndpoint: '/problems',
-            autoSyncMonthly: true,
-            isActive: false,
-            lastSyncAt: null,
-            lastSyncStatus: null,
-            lastSyncSummary: null,
-          },
+          tenantId,
+          baseUrl: 'https://api.helpcopies.com/api',
+          authType: ErpAuthType.BEARER_TOKEN,
+          apiKey: '',
+          hasApiKey: false,
+          apiKeyHeader: 'x-api-key',
+          loginEndpoint: '/auth/login',
+          username: '',
+          password: '',
+          hasPassword: false,
+          customersEndpoint: '/clients',
+          equipmentsEndpoint: '/machines',
+          problemsEndpoint: '/problems',
+          autoSyncMonthly: true,
+          isActive: false,
+          lastSyncAt: null,
+          lastSyncStatus: null,
+          lastSyncSummary: null,
+        },
       stats: {
         customersCount,
         equipmentsCount,
@@ -187,22 +189,22 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     const saved = existing
       ? await this.prisma.erpIntegration.update({ where: { tenantId }, data })
       : await this.prisma.erpIntegration.create({
-          data: {
-            tenantId,
-            baseUrl: dto.baseUrl?.trim() || 'https://api.helpcopies.com/api',
-            authType: dto.authType || ErpAuthType.BEARER_TOKEN,
-            apiKey: dto.apiKey && dto.apiKey !== '********' ? dto.apiKey.trim() : null,
-            apiKeyHeader: dto.apiKeyHeader?.trim() || 'x-api-key',
-            loginEndpoint: dto.loginEndpoint?.trim() || '/auth/login',
-            username: dto.username?.trim() || null,
-            password: dto.password && dto.password !== '********' ? dto.password.trim() : null,
-            customersEndpoint: dto.customersEndpoint?.trim() || '/clients',
-            equipmentsEndpoint: dto.equipmentsEndpoint?.trim() || '/machines',
-            problemsEndpoint: dto.problemsEndpoint?.trim() || '/problems',
-            autoSyncMonthly: dto.autoSyncMonthly ?? true,
-            isActive: dto.isActive ?? false,
-          },
-        });
+        data: {
+          tenantId,
+          baseUrl: dto.baseUrl?.trim() || 'https://api.helpcopies.com/api',
+          authType: dto.authType || ErpAuthType.BEARER_TOKEN,
+          apiKey: dto.apiKey && dto.apiKey !== '********' ? dto.apiKey.trim() : null,
+          apiKeyHeader: dto.apiKeyHeader?.trim() || 'x-api-key',
+          loginEndpoint: dto.loginEndpoint?.trim() || '/auth/login',
+          username: dto.username?.trim() || null,
+          password: dto.password && dto.password !== '********' ? dto.password.trim() : null,
+          customersEndpoint: dto.customersEndpoint?.trim() || '/clients',
+          equipmentsEndpoint: dto.equipmentsEndpoint?.trim() || '/machines',
+          problemsEndpoint: dto.problemsEndpoint?.trim() || '/problems',
+          autoSyncMonthly: dto.autoSyncMonthly ?? true,
+          isActive: dto.isActive ?? false,
+        },
+      });
 
     await this.auditService.log({
       tenantId,
@@ -235,6 +237,86 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     return status ? `HTTP ${status}: ${msg}` : msg;
   }
 
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private reportSyncProgress(params: {
+    tenantId?: string;
+    stage:
+      | 'auth'
+      | 'fetch_customers'
+      | 'fetch_equipments'
+      | 'fetch_problems'
+      | 'save_customers'
+      | 'save_equipments'
+      | 'save_problems'
+      | 'completed'
+      | 'error';
+    level?: 'info' | 'success' | 'warn' | 'error';
+    message: string;
+    progress?: number;
+  }) {
+    const level = params.level || 'info';
+    const logLine = `[HelpCopies ERP] ${params.message}`;
+    if (level === 'error') {
+      this.logger.error(logLine);
+    } else if (level === 'warn') {
+      this.logger.warn(logLine);
+    } else {
+      this.logger.log(logLine);
+    }
+
+    if (params.tenantId) {
+      this.eventsGateway.emitToTenantAndSuperAdmins(params.tenantId, 'erp:sync_progress', {
+        tenantId: params.tenantId,
+        stage: params.stage,
+        level,
+        message: params.message,
+        progress: params.progress,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
+   * Ejecuta una petición HTTP hacia HelpCopies ERP reintentando ante HTTP 429 (ThrottlerException).
+   */
+  private async requestWithRateLimitRetry<T>(
+    label: string,
+    fn: () => Promise<T>,
+    maxRetries = 4,
+    onRetryWarn?: (message: string) => void,
+  ): Promise<T> {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (error: any) {
+        const status = error?.response?.status;
+        if (status !== 429 || attempt === maxRetries) {
+          throw error;
+        }
+        const retryAfterRaw =
+          error?.response?.headers?.['retry-after'] ||
+          error?.response?.headers?.['x-ratelimit-reset'];
+        const retryAfterSec = retryAfterRaw ? Number(retryAfterRaw) : NaN;
+        const defaultDelays = [3000, 6000, 10000, 15000];
+        const waitMs =
+          Number.isFinite(retryAfterSec) && retryAfterSec > 0
+            ? Math.min(retryAfterSec * 1000, 30000)
+            : (defaultDelays[attempt] ?? 15000);
+        const warnMsg = `Límite de peticiones (HTTP 429) en ${label}. Esperando ${Math.round(waitMs / 1000)}s para reintentar (${attempt + 1}/${maxRetries})...`;
+        if (onRetryWarn) {
+          onRetryWarn(warnMsg);
+        } else {
+          this.logger.warn(`[HelpCopies ERP] ${warnMsg}`);
+        }
+        await this.sleep(waitMs);
+      }
+    }
+    throw new BadRequestException(`Se agotaron los reintentos para ${label}`);
+  }
+
   async getProblems(tenantId: string) {
     return this.prisma.problemType.findMany({
       where: { tenantId },
@@ -242,15 +324,18 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private async buildHeaders(integration: {
-    baseUrl: string | null;
-    authType: ErpAuthType;
-    apiKey: string | null;
-    apiKeyHeader: string;
-    loginEndpoint: string | null;
-    username: string | null;
-    password: string | null;
-  }): Promise<Record<string, string>> {
+  private async buildHeaders(
+    integration: {
+      baseUrl: string | null;
+      authType: ErpAuthType;
+      apiKey: string | null;
+      apiKeyHeader: string;
+      loginEndpoint: string | null;
+      username: string | null;
+      password: string | null;
+    },
+    tenantId?: string,
+  ): Promise<Record<string, string>> {
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (!integration.baseUrl) {
       throw new BadRequestException('Debes configurar la URL base del backend HelpCopies ERP primero');
@@ -265,12 +350,31 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
         throw new BadRequestException('Faltan usuario o contraseña para autenticar contra HelpCopies ERP');
       }
       const loginUrl = joinErpUrl(integration.baseUrl, integration.loginEndpoint || '/auth/login');
+      this.reportSyncProgress({
+        tenantId,
+        stage: 'auth',
+        message: `Autenticando contra ${loginUrl}...`,
+        progress: 5,
+      });
       try {
-        const authRes = await firstValueFrom(
-          this.httpService.post(loginUrl, {
-            username: integration.username,
-            password: integration.password,
-          }),
+        const authRes = await this.requestWithRateLimitRetry(
+          `Login (${loginUrl})`,
+          () =>
+            firstValueFrom(
+              this.httpService.post(loginUrl, {
+                username: integration.username,
+                password: integration.password,
+              }),
+            ),
+          4,
+          (warnMsg) =>
+            this.reportSyncProgress({
+              tenantId,
+              stage: 'auth',
+              level: 'warn',
+              message: warnMsg,
+              progress: 5,
+            }),
         );
         const token =
           authRes.data?.access_token ||
@@ -281,16 +385,31 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
           authRes.data?.data?.accessToken ||
           authRes.data?.data?.token;
         if (!token) {
-          this.logger.error(`[HelpCopies ERP] ✖ Login sin token válido en ${loginUrl}`);
-          throw new BadRequestException('El login de HelpCopies ERP no devolvió un token válido');
+          const erpMsg = authRes.data?.message ? ` (${authRes.data.message})` : '';
+          this.reportSyncProgress({
+            tenantId,
+            stage: 'error',
+            level: 'error',
+            message: `✖ Login sin token válido en ${loginUrl}${erpMsg}`,
+          });
+          throw new BadRequestException(`El login de HelpCopies ERP no devolvió un token válido${erpMsg}`);
         }
-        this.logger.log(`[HelpCopies ERP] ✔ Autenticación exitosa contra ${loginUrl}`);
+        this.reportSyncProgress({
+          tenantId,
+          stage: 'auth',
+          level: 'success',
+          message: `✔ Autenticación exitosa contra HelpCopies ERP.`,
+          progress: 10,
+        });
         headers.Authorization = `Bearer ${token}`;
       } catch (error: any) {
         if (error instanceof BadRequestException) throw error;
-        this.logger.error(
-          `[HelpCopies ERP] ✖ Error de autenticación en ${loginUrl}: ${this.extractErpErrorMessage(error)}`,
-        );
+        this.reportSyncProgress({
+          tenantId,
+          stage: 'error',
+          level: 'error',
+          message: `✖ Error de autenticación en ${loginUrl}: ${this.extractErpErrorMessage(error)}`,
+        });
         throw error;
       }
     }
@@ -306,7 +425,9 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
   ) {
     const url = joinErpUrl(baseUrl, endpoint);
     try {
-      const response = await firstValueFrom(this.httpService.get(url, { headers }));
+      const response = await this.requestWithRateLimitRetry(label, () =>
+        firstValueFrom(this.httpService.get(url, { headers })),
+      );
       const unwrapped = unwrapErpCollection(response.data);
       const detected = unwrapped.total ?? unwrapped.items.length;
       this.logger.log(`[HelpCopies ERP] ✔ ${label} conectado correctamente (${url}) -> ${detected} registros`);
@@ -324,10 +445,44 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     endpoint: string,
     headers: Record<string, string>,
     paginateIfWrapped = false,
+    progressMeta?: {
+      tenantId: string;
+      stage: 'fetch_customers' | 'fetch_equipments' | 'fetch_problems';
+      startProgress: number;
+      endProgress: number;
+    },
   ): Promise<Record<string, any>[]> {
     const firstUrl = joinErpUrl(baseUrl, endpoint);
+    const emit = (
+      message: string,
+      level: 'info' | 'success' | 'warn' | 'error' = 'info',
+      progress?: number,
+    ) => {
+      if (progressMeta) {
+        this.reportSyncProgress({
+          tenantId: progressMeta.tenantId,
+          stage: progressMeta.stage,
+          level,
+          message,
+          progress,
+        });
+      } else if (level === 'error') {
+        this.logger.error(`[HelpCopies ERP] ${message}`);
+      } else if (level === 'warn') {
+        this.logger.warn(`[HelpCopies ERP] ${message}`);
+      } else {
+        this.logger.log(`[HelpCopies ERP] ${message}`);
+      }
+    };
+
     try {
-      const firstRes = await firstValueFrom(this.httpService.get(firstUrl, { headers }));
+      emit(`Descargando ${label} desde ${firstUrl}...`, 'info', progressMeta?.startProgress);
+      const firstRes = await this.requestWithRateLimitRetry(
+        `${label} (pág. 1)`,
+        () => firstValueFrom(this.httpService.get(firstUrl, { headers })),
+        4,
+        (warnMsg) => emit(warnMsg, 'warn', progressMeta?.startProgress),
+      );
       const firstUnwrapped = unwrapErpCollection(firstRes.data);
 
       if (
@@ -336,34 +491,66 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
         firstUnwrapped.items.length >= firstUnwrapped.total ||
         firstUnwrapped.items.length === 0
       ) {
-        this.logger.log(
-          `[HelpCopies ERP] ✔ ${label} obtenidos (${firstUrl}) -> ${firstUnwrapped.items.length} registros`,
+        emit(
+          `✔ ${label} descargados (${firstUnwrapped.items.length} registros).`,
+          'success',
+          progressMeta?.endProgress,
         );
         return firstUnwrapped.items;
       }
 
-      // Si /clients viene paginado ({ data, total }), recorremos las páginas siguientes
+      // Si /clients viene paginado ({ data, total }), recorremos las páginas siguientes con pausa anti-throttling
       const collected = [...firstUnwrapped.items];
       const pageSize = firstUnwrapped.items.length;
-      const totalPages = Math.ceil(firstUnwrapped.total / pageSize);
+      const totalPages = Math.min(Math.ceil(firstUnwrapped.total / pageSize), 100);
       const separator = firstUrl.includes('?') ? '&' : '?';
 
-      for (let page = 2; page <= Math.min(totalPages, 100); page++) {
+      emit(
+        `${label}: página 1/${totalPages} (${collected.length}/${firstUnwrapped.total} registros)...`,
+        'info',
+        progressMeta
+          ? Math.round(
+              progressMeta.startProgress +
+                ((progressMeta.endProgress - progressMeta.startProgress) * 1) / totalPages,
+            )
+          : undefined,
+      );
+
+      for (let page = 2; page <= totalPages; page++) {
+        await this.sleep(350);
         const pageUrl = `${firstUrl}${separator}page=${page}&limit=${pageSize}`;
-        const pageRes = await firstValueFrom(this.httpService.get(pageUrl, { headers }));
+        const pageProgress = progressMeta
+          ? Math.round(
+              progressMeta.startProgress +
+                ((progressMeta.endProgress - progressMeta.startProgress) * page) / totalPages,
+            )
+          : undefined;
+        const pageRes = await this.requestWithRateLimitRetry(
+          `${label} (pág. ${page}/${totalPages})`,
+          () => firstValueFrom(this.httpService.get(pageUrl, { headers })),
+          4,
+          (warnMsg) => emit(warnMsg, 'warn', pageProgress),
+        );
         const next = unwrapErpCollection(pageRes.data);
         if (next.items.length === 0) break;
         collected.push(...next.items);
+        emit(
+          `${label}: página ${page}/${totalPages} (${collected.length}/${firstUnwrapped.total} registros)...`,
+          'info',
+          pageProgress,
+        );
         if (collected.length >= firstUnwrapped.total) break;
       }
 
-      this.logger.log(
-        `[HelpCopies ERP] ✔ ${label} obtenidos (${firstUrl}) -> ${collected.length} registros`,
+      emit(
+        `✔ ${label} descargados (${collected.length} registros).`,
+        'success',
+        progressMeta?.endProgress,
       );
       return collected;
     } catch (error: any) {
       const detail = this.extractErpErrorMessage(error);
-      this.logger.error(`[HelpCopies ERP] ✖ No se pudieron obtener ${label} (${firstUrl}): ${detail}`);
+      emit(`✖ No se pudieron obtener ${label} (${firstUrl}): ${detail}`, 'error');
       throw error;
     }
   }
@@ -447,11 +634,26 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
 
     try {
       const headers = await this.buildHeaders(integration);
-      const [customersProbe, equipmentsProbe, problemsProbe] = await Promise.all([
-        this.probeEndpoint('Clientes', integration.baseUrl, integration.customersEndpoint, headers),
-        this.probeEndpoint('Equipos', integration.baseUrl, integration.equipmentsEndpoint, headers),
-        this.probeEndpoint('Problemas', integration.baseUrl, integration.problemsEndpoint, headers),
-      ]);
+      const customersProbe = await this.probeEndpoint(
+        'Clientes',
+        integration.baseUrl,
+        integration.customersEndpoint,
+        headers,
+      );
+      await this.sleep(250);
+      const equipmentsProbe = await this.probeEndpoint(
+        'Equipos',
+        integration.baseUrl,
+        integration.equipmentsEndpoint,
+        headers,
+      );
+      await this.sleep(250);
+      const problemsProbe = await this.probeEndpoint(
+        'Problemas',
+        integration.baseUrl,
+        integration.problemsEndpoint,
+        headers,
+      );
 
       const failed = [
         !customersProbe.ok ? `Clientes (${customersProbe.detail})` : null,
@@ -500,9 +702,12 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     }
 
     this.runningTenants.add(tenantId);
-    this.logger.log(
-      `[HelpCopies ERP] Iniciando sincronización (Clientes, Equipos, Problemas) desde ${integration.baseUrl} para tenant ${tenantId}...`,
-    );
+    this.reportSyncProgress({
+      tenantId,
+      stage: 'auth',
+      message: `Iniciando sincronización ERP desde ${integration.baseUrl}...`,
+      progress: 2,
+    });
 
     const summary = {
       customersCreated: 0,
@@ -516,23 +721,73 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
     };
 
     try {
-      const headers = await this.buildHeaders(integration);
-      const [customersRaw, equipmentsRaw, problemsRaw] = await Promise.all([
-        this.fetchCollection('Clientes', integration.baseUrl, integration.customersEndpoint, headers, true),
-        this.fetchCollection('Equipos', integration.baseUrl, integration.equipmentsEndpoint, headers, false),
-        this.fetchCollection('Problemas', integration.baseUrl, integration.problemsEndpoint, headers, false),
-      ]);
+      const headers = await this.buildHeaders(integration, tenantId);
+      const customersRaw = await this.fetchCollection(
+        'Clientes',
+        integration.baseUrl,
+        integration.customersEndpoint,
+        headers,
+        true,
+        { tenantId, stage: 'fetch_customers', startProgress: 12, endProgress: 35 },
+      );
+      await this.sleep(350);
+      const equipmentsRaw = await this.fetchCollection(
+        'Equipos',
+        integration.baseUrl,
+        integration.equipmentsEndpoint,
+        headers,
+        false,
+        { tenantId, stage: 'fetch_equipments', startProgress: 36, endProgress: 48 },
+      );
+      await this.sleep(350);
+      const problemsRaw = await this.fetchCollection(
+        'Problemas',
+        integration.baseUrl,
+        integration.problemsEndpoint,
+        headers,
+        false,
+        { tenantId, stage: 'fetch_problems', startProgress: 49, endProgress: 56 },
+      );
 
       const customerIdByCode = new Map<string, string>();
 
       // 1. Sincronizar Clientes (/clients -> { data, total })
+      this.reportSyncProgress({
+        tenantId,
+        stage: 'save_customers',
+        message: `Guardando ${customersRaw.length} clientes en base de datos...`,
+        progress: 58,
+      });
       for (let i = 0; i < customersRaw.length; i++) {
         const res = await this.upsertCustomerRow(tenantId, customersRaw[i], i, customerIdByCode);
         if (res === 'created') summary.customersCreated++;
         else if (res === 'updated') summary.customersUpdated++;
+
+        if ((i + 1) % 25 === 0 && i + 1 < customersRaw.length) {
+          const pct = Math.round(58 + ((i + 1) / customersRaw.length) * 16);
+          this.reportSyncProgress({
+            tenantId,
+            stage: 'save_customers',
+            message: `Procesando clientes: ${i + 1}/${customersRaw.length}...`,
+            progress: pct,
+          });
+        }
       }
+      this.reportSyncProgress({
+        tenantId,
+        stage: 'save_customers',
+        level: 'success',
+        message: `✔ Clientes guardados: +${summary.customersCreated} nuevos, ${summary.customersUpdated} actualizados.`,
+        progress: 75,
+      });
 
       // 2. Sincronizar Máquinas (/machines -> array directo con codClient + model.brand + client)
+      this.reportSyncProgress({
+        tenantId,
+        stage: 'save_equipments',
+        message: `Guardando ${equipmentsRaw.length} equipos en base de datos...`,
+        progress: 76,
+      });
       for (let i = 0; i < equipmentsRaw.length; i++) {
         const mapped = mapErpEquipment(equipmentsRaw[i], i);
         if (!mapped) continue;
@@ -609,9 +864,32 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
           });
           summary.equipmentsCreated++;
         }
+
+        if ((i + 1) % 25 === 0 && i + 1 < equipmentsRaw.length) {
+          const pct = Math.round(76 + ((i + 1) / equipmentsRaw.length) * 14);
+          this.reportSyncProgress({
+            tenantId,
+            stage: 'save_equipments',
+            message: `Procesando equipos: ${i + 1}/${equipmentsRaw.length}...`,
+            progress: pct,
+          });
+        }
       }
+      this.reportSyncProgress({
+        tenantId,
+        stage: 'save_equipments',
+        level: 'success',
+        message: `✔ Equipos guardados: +${summary.equipmentsCreated} nuevos, ${summary.equipmentsUpdated} actualizados (${summary.equipmentsOrphan} sin cliente).`,
+        progress: 91,
+      });
 
       // 3. Sincronizar Catálogo de Problemas (/problems -> array directo con id, description, status)
+      this.reportSyncProgress({
+        tenantId,
+        stage: 'save_problems',
+        message: `Guardando ${problemsRaw.length} problemas en el catálogo...`,
+        progress: 92,
+      });
       for (const row of problemsRaw) {
         const mapped = mapErpProblem(row);
         if (!mapped) continue;
@@ -681,16 +959,25 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
         link: '/companies',
       });
 
-      this.logger.log(
-        `[HelpCopies ERP] ✔ Sincronización completada para tenant ${tenantId} | Clientes: +${summary.customersCreated}/~${summary.customersUpdated} | Equipos: +${summary.equipmentsCreated}/~${summary.equipmentsUpdated} (huérfanos: ${summary.equipmentsOrphan}) | Problemas: +${summary.problemsCreated}/~${summary.problemsUpdated}`,
-      );
+      this.reportSyncProgress({
+        tenantId,
+        stage: 'completed',
+        level: 'success',
+        message: `✔ Sincronización completada | Clientes: +${summary.customersCreated}/~${summary.customersUpdated} | Equipos: +${summary.equipmentsCreated}/~${summary.equipmentsUpdated} (sin cliente: ${summary.equipmentsOrphan}) | Problemas: +${summary.problemsCreated}/~${summary.problemsUpdated}`,
+        progress: 100,
+      });
 
       return summary;
     } catch (error: any) {
       const detail = this.extractErpErrorMessage(error);
       summary.errors.push(detail);
 
-      this.logger.error(`[HelpCopies ERP] ✖ Falló la sincronización para tenant ${tenantId}: ${detail}`);
+      this.reportSyncProgress({
+        tenantId,
+        stage: 'error',
+        level: 'error',
+        message: `✖ Falló la sincronización ERP: ${detail}`,
+      });
 
       await this.prisma.erpIntegration.update({
         where: { tenantId },

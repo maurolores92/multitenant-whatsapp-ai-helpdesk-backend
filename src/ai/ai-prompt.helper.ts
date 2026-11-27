@@ -8,6 +8,15 @@ import {
   ProblemType,
   SenderType,
 } from '@prisma/client';
+import {
+  Content,
+  createPartFromFunctionResponse,
+  FunctionDeclaration,
+  GoogleGenAI,
+  Part,
+  Type,
+} from '@google/genai';
+import type { PrismaService } from '../prisma/prisma.service';
 
 const RULE_CATEGORY_LABEL: Record<AiRuleCategory, string> = {
   TONE: 'Tono y Estilo',
@@ -26,11 +35,13 @@ export interface TenantAiPromptContext {
 }
 
 export const TICKET_ESCALATION_PROTOCOL = `
-PROTOCOLO TÉCNICO INTERNO DE DERIVACIÓN (NO MOSTRAR AL CLIENTE):
-- Evalúa la consulta usando exclusivamente la DIRECTIVA BASE, las REGLAS DE OBLIGATORIO CUMPLIMIENTO (en especial las de Criterio de Derivación), la BASE DE CONOCIMIENTOS y el CATÁLOGO DE PROBLEMAS configurados para la empresa.
-- Si puedes resolver o responder la consulta sin crear un ticket según esas reglas, responde normalmente al cliente SIN agregar el JSON de escalación.
-- Únicamente si corresponde derivar y crear un ticket, agrega al final de tu respuesta una única línea exacta sin bloques de código Markdown:
-ESCALATION_JSON:{"shouldEscalate":true,"reason":"Resumen corto del motivo","ticketReason":"MECHANICAL_FAILURE"|"ELECTRICAL_ERROR"|"TONER_SUPPLIES"|"CALIBRATION_SOFTWARE"|"PREVENTIVE_MAINTENANCE"|"ADMINISTRATIVE"|"OTHER","problemTypeId":"ID del catálogo ERP o null","serviceType":"REMOTE_WHATSAPP"|"ONSITE_PHYSICAL","priority":"LOW"|"MEDIUM"|"HIGH"|"CRITICAL","diagnosticSummary":"Diagnóstico técnico detallado para el operador","equipmentId":"ID del equipo afectado o null"}
+PROTOCOLO TÉCNICO INTERNO DE IDENTIFICACIÓN DE EQUIPO Y DERIVACIÓN (NO MOSTRAR AL CLIENTE):
+- Evalúa la consulta usando exclusivamente la DIRECTIVA BASE, las REGLAS DE OBLIGATORIO CUMPLIMIENTO, la BASE DE CONOCIMIENTOS y el CATÁLOGO DE PROBLEMAS DEL ERP configurados para la empresa.
+- IMPORTANTE SOBRE IDENTIFICACIÓN DEL CLIENTE: No asumas quién es el cliente por su número de WhatsApp. El cliente y la máquina se identifican mediante el **ID, código interno o número de serie del equipo**.
+- Si el cliente todavía no indicó el ID/código/serie del equipo afectado, pídeselo amablemente antes de crear el ticket (salvo que la consulta sea meramente general o administrativa que no requiera equipo).
+- Apenas el cliente mencione un ID, código o número de serie de máquina, DEBES llamar primero a la herramienta \`buscar_equipo_por_id\` para consultar la base de datos y obtener el \`equipmentId\` real y los datos del cliente propietario (vía \`codClient\`).
+- Una vez identificado el equipo y conocido el problema (y si no pudiste resolverlo según las reglas de la empresa), clasifica el problema usando el CATÁLOGO DE PROBLEMAS DEL ERP y agrega al final de tu respuesta una única línea exacta sin bloques de código Markdown:
+ESCALATION_JSON:{"shouldEscalate":true,"reason":"Resumen corto del motivo","ticketReason":"MECHANICAL_FAILURE"|"ELECTRICAL_ERROR"|"TONER_SUPPLIES"|"CALIBRATION_SOFTWARE"|"PREVENTIVE_MAINTENANCE"|"ADMINISTRATIVE"|"OTHER","problemTypeId":"ID exacto del catálogo de problemas ERP o null","serviceType":"REMOTE_WHATSAPP"|"ONSITE_PHYSICAL","priority":"LOW"|"MEDIUM"|"HIGH"|"CRITICAL","diagnosticSummary":"Diagnóstico técnico detallado incluyendo equipo y cliente identificado","equipmentId":"ID exacto (UUID) del equipo obtenido con buscar_equipo_por_id o null"}
 `.trim();
 
 /**
@@ -82,21 +93,22 @@ export function buildTenantAiSystemInstructions(tenant: TenantAiPromptContext): 
  */
 export function buildCustomerConversationContext(params: {
   customerName: string;
-  equipments: Pick<Equipment, 'id' | 'name' | 'brand' | 'model' | 'serialNumber'>[];
+  customerExternalCode?: string | null;
+  equipments: Pick<Equipment, 'id' | 'name' | 'brand' | 'model' | 'serialNumber' | 'externalCode' | 'clientCode'>[];
   recentMessages: Pick<Message, 'senderType' | 'content'>[];
   latestMessage: string;
 }): string {
-  const { customerName, equipments, recentMessages, latestMessage } = params;
+  const { customerName, customerExternalCode, equipments, recentMessages, latestMessage } = params;
 
   const eqText =
     equipments.length > 0
       ? equipments
           .map(
             (eq) =>
-              `- [ID: ${eq.id}] ${eq.name} (Marca: ${eq.brand || 'N/A'}, Modelo: ${eq.model || 'N/A'}, S/N: ${eq.serialNumber || 'N/A'})`,
+              `- [ID: ${eq.id}] ${eq.name} (Cod. ERP: ${eq.externalCode || 'N/A'}, codClient: ${eq.clientCode || 'N/A'}, Marca: ${eq.brand || 'N/A'}, Modelo: ${eq.model || 'N/A'}, S/N: ${eq.serialNumber || 'N/A'})`,
           )
           .join('\n')
-      : 'Sin equipos registrados en la ficha del cliente.';
+      : 'Pendiente: aún no se identificó el equipo. Solicita el ID/código/serie del equipo y usa la herramienta buscar_equipo_por_id.';
 
   const senderLabel: Record<SenderType, string> = {
     CUSTOMER: 'Cliente',
@@ -109,9 +121,13 @@ export function buildCustomerConversationContext(params: {
     .slice(-8)
     .map((m) => `${senderLabel[m.senderType] || m.senderType}: ${m.content}`);
 
+  const clientHeader = customerExternalCode
+    ? `${customerName} (codClient: ${customerExternalCode})`
+    : `${customerName} (cliente aún no identificado por equipo; pedir ID/código del equipo)`;
+
   return [
-    `CLIENTE ACTUAL: ${customerName}`,
-    `EQUIPOS REGISTRADOS DEL CLIENTE:\n${eqText}`,
+    `CONTACTO EN CHAT: ${clientHeader}`,
+    `EQUIPOS ASOCIADOS:\n${eqText}`,
     historyLines.length > 0 ? `HISTORIAL RECIENTE DE LA CONVERSACIÓN:\n${historyLines.join('\n')}` : '',
     `ÚLTIMO MENSAJE DEL CLIENTE:\n"${latestMessage}"`,
   ]
@@ -205,6 +221,249 @@ export async function callGeminiWithRetry<T>(
     }
   }
   throw lastError;
+}
+
+export const LOOKUP_EQUIPMENT_TOOL: FunctionDeclaration = {
+  name: 'buscar_equipo_por_id',
+  description:
+    'Consulta la base de datos de máquinas/equipos del tenant por ID, código externo, código interno, ID legado o número de serie. Devuelve los datos del equipo y del cliente propietario asociado mediante codClient.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      codigoEquipo: {
+        type: Type.STRING,
+        description:
+          'ID, código interno, código externo del ERP o número de serie de la máquina suministrado por el cliente.',
+      },
+    },
+    required: ['codigoEquipo'],
+  },
+};
+
+/**
+ * Busca una máquina en la base de datos por ID/código/serie y resuelve su cliente asociado vía codClient/customerId.
+ */
+export async function findEquipmentAndClientByCode(
+  prisma: PrismaService,
+  tenantId: string,
+  rawCode: string,
+): Promise<{
+  found: boolean;
+  searchedCode: string;
+  matches: Array<{
+    equipmentId: string;
+    externalCode: string | null;
+    internalCode: string | null;
+    name: string;
+    brand: string | null;
+    model: string | null;
+    serialNumber: string | null;
+    status: string;
+    codClient: string | null;
+    customer: {
+      customerId: string;
+      externalCode: string | null;
+      name: string;
+      companyName: string | null;
+      cuit: string | null;
+      address: string | null;
+      locality: string | null;
+    } | null;
+  }>;
+}> {
+  const clean = rawCode.trim().replace(/^#/, '');
+  if (!clean) {
+    return { found: false, searchedCode: rawCode, matches: [] };
+  }
+
+  const strippedZeros = clean.replace(/^0+/, '') || clean;
+  const numericCandidate = /^\d+$/.test(clean) ? Number(clean) : null;
+
+  // 1. Priorizar búsqueda por machine.code (specifications.internalCode), que es el N° de equipo visible para el cliente
+  let equipments = await prisma.equipment.findMany({
+    where: {
+      tenantId,
+      OR: [
+        { specifications: { path: ['internalCode'], equals: clean } },
+        { specifications: { path: ['internalCode'], equals: strippedZeros } },
+        ...(numericCandidate !== null
+          ? [{ specifications: { path: ['internalCode'], equals: numericCandidate } }]
+          : []),
+        { name: { contains: `(Int. ${clean})`, mode: 'insensitive' } },
+      ],
+    },
+    include: { customer: true },
+    take: 5,
+  });
+
+  // 2. Fallback por número de serie, UUID interno o ID numérico del ERP (externalCode / legacyMachineId)
+  if (equipments.length === 0) {
+    equipments = await prisma.equipment.findMany({
+      where: {
+        tenantId,
+        OR: [
+          { serialNumber: { equals: clean, mode: 'insensitive' } },
+          { id: clean },
+          { externalCode: { equals: clean, mode: 'insensitive' } },
+          { externalCode: { equals: strippedZeros, mode: 'insensitive' } },
+          { specifications: { path: ['legacyMachineId'], equals: clean } },
+          { specifications: { path: ['erpId'], equals: clean } },
+          ...(numericCandidate !== null
+            ? [
+                { specifications: { path: ['erpId'], equals: numericCandidate } },
+                { specifications: { path: ['legacyMachineId'], equals: numericCandidate } },
+              ]
+            : []),
+        ],
+      },
+      include: { customer: true },
+      take: 5,
+    });
+  }
+
+  const matches = await Promise.all(
+    equipments.map(async (eq) => {
+      let resolvedCustomer = eq.customer;
+      if ((!resolvedCustomer || !resolvedCustomer.externalCode) && eq.clientCode) {
+        const cleanCod = eq.clientCode.trim();
+        const strippedCod = cleanCod.replace(/^0+/, '') || cleanCod;
+        const byCod = await prisma.customer.findFirst({
+          where: {
+            tenantId,
+            OR: [{ externalCode: cleanCod }, { externalCode: strippedCod }],
+          },
+        });
+        if (byCod) {
+          resolvedCustomer = byCod;
+        }
+      }
+
+      const specs = (eq.specifications && typeof eq.specifications === 'object' ? eq.specifications : {}) as Record<
+        string,
+        any
+      >;
+
+      return {
+        equipmentId: eq.id,
+        externalCode: eq.externalCode,
+        internalCode: specs.internalCode ? String(specs.internalCode) : null,
+        name: eq.name,
+        brand: eq.brand,
+        model: eq.model,
+        serialNumber: eq.serialNumber,
+        status: eq.status,
+        codClient: eq.clientCode || resolvedCustomer?.externalCode || null,
+        customer: resolvedCustomer
+          ? {
+              customerId: resolvedCustomer.id,
+              externalCode: resolvedCustomer.externalCode,
+              name: resolvedCustomer.name,
+              companyName: resolvedCustomer.companyName,
+              cuit: resolvedCustomer.cuit,
+              address: resolvedCustomer.address,
+              locality: resolvedCustomer.locality,
+            }
+          : null,
+      };
+    }),
+  );
+
+  return {
+    found: matches.length > 0,
+    searchedCode: clean,
+    matches,
+  };
+}
+
+/**
+ * Ejecuta Gemini habilitando la herramienta buscar_equipo_por_id para consultar máquinas y su cliente (codClient).
+ */
+export async function generateGeminiWithEquipmentTools(params: {
+  client: GoogleGenAI;
+  prisma: PrismaService;
+  tenantId: string;
+  preferredModel: string;
+  systemInstruction: string;
+  userContext: string;
+  temperature: number;
+}): Promise<{
+  text: string;
+  modelUsed: string;
+  matchedEquipmentId?: string;
+  matchedCustomerId?: string;
+}> {
+  const { client, prisma, tenantId, preferredModel, systemInstruction, userContext, temperature } = params;
+  const contents: Content[] = [{ role: 'user', parts: [{ text: userContext }] }];
+  let lastModelUsed = preferredModel;
+  let matchedEquipmentId: string | undefined;
+  let matchedCustomerId: string | undefined;
+
+  for (let round = 0; round < 3; round++) {
+    const { result: response, modelUsed } = await generateGeminiWithFallback(preferredModel, (model) =>
+      client.models.generateContent({
+        model,
+        contents,
+        config: {
+          systemInstruction,
+          temperature,
+          tools: [{ functionDeclarations: [LOOKUP_EQUIPMENT_TOOL] }],
+        },
+      }),
+    );
+    lastModelUsed = modelUsed;
+
+    const functionCalls = response.functionCalls;
+    if (!functionCalls || functionCalls.length === 0) {
+      return {
+        text: response.text || '',
+        modelUsed: lastModelUsed,
+        matchedEquipmentId,
+        matchedCustomerId,
+      };
+    }
+
+    const modelContent = response.candidates?.[0]?.content;
+    if (modelContent) {
+      contents.push(modelContent);
+    }
+
+    const responseParts: Part[] = [];
+    for (const call of functionCalls) {
+      if (call.name === 'buscar_equipo_por_id') {
+        const codigo = String(call.args?.codigoEquipo || '');
+        const lookup = await findEquipmentAndClientByCode(prisma, tenantId, codigo);
+        if (lookup.matches.length === 1) {
+          matchedEquipmentId = lookup.matches[0].equipmentId;
+          matchedCustomerId = lookup.matches[0].customer?.customerId;
+        }
+        responseParts.push(
+          createPartFromFunctionResponse(
+            call.id || call.name,
+            call.name,
+            lookup as unknown as Record<string, unknown>,
+          ),
+        );
+      }
+    }
+
+    if (responseParts.length === 0) {
+      return {
+        text: response.text || '',
+        modelUsed: lastModelUsed,
+        matchedEquipmentId,
+        matchedCustomerId,
+      };
+    }
+
+    contents.push({ role: 'user', parts: responseParts });
+  }
+
+  return {
+    text: '',
+    modelUsed: lastModelUsed,
+    matchedEquipmentId,
+    matchedCustomerId,
+  };
 }
 
 /**

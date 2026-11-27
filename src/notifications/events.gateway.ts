@@ -133,6 +133,14 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
+   * Emite un evento a los operadores de una empresa y a todos los Superadmins conectados
+   */
+  emitToTenantAndSuperAdmins(tenantId: string, event: string, payload: any) {
+    this.server.to(`tenant_${tenantId}`).to('superadmin_room').emit(event, payload);
+    this.logger.debug(`[WS Emit -> tenant_${tenantId} + superadmin_room] Event: ${event}`);
+  }
+
+  /**
    * Emite un evento a un usuario operador específico
    */
   emitToUser(tenantId: string, userId: string, event: string, payload: any) {
