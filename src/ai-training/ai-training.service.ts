@@ -524,8 +524,14 @@ export class AiTrainingService {
 
     let responseText = '';
     let isLiveAi = false;
-    let matchedEquipmentSummary: { id: string; name: string; code: string | null; customerName: string | null } | null =
-      null;
+    let matchedEquipmentSummary: {
+      id: string;
+      name: string;
+      code: string | null;
+      customerName: string | null;
+      openTicketId?: string | null;
+      openTicketStatus?: string | null;
+    } | null = null;
 
     if (apiKey && apiKey !== 'your-gemini-api-key') {
       try {
@@ -554,6 +560,7 @@ export class AiTrainingService {
             codClient: m.codClient,
             customerCompanyName: m.customer?.companyName || null,
             customerName: m.customer?.name || null,
+            activeTickets: m.activeTickets,
           })),
           recentMessages,
           latestMessage: message,
@@ -571,10 +578,21 @@ export class AiTrainingService {
         });
         model = modelUsed;
         if (matchedEquipmentId) {
-          const eq = await this.prisma.equipment.findUnique({
-            where: { id: matchedEquipmentId },
-            include: { customer: { select: { name: true, companyName: true } } },
-          });
+          const [eq, openTicket] = await Promise.all([
+            this.prisma.equipment.findUnique({
+              where: { id: matchedEquipmentId },
+              include: { customer: { select: { name: true, companyName: true } } },
+            }),
+            this.prisma.ticket.findFirst({
+              where: {
+                tenantId: tenant.id,
+                equipmentId: matchedEquipmentId,
+                status: { notIn: ['RESOLVED', 'CANCELLED'] },
+              },
+              orderBy: { createdAt: 'desc' },
+              select: { id: true, status: true },
+            }),
+          ]);
           if (eq) {
             const specs = (eq.specifications && typeof eq.specifications === 'object'
               ? eq.specifications
@@ -584,6 +602,8 @@ export class AiTrainingService {
               name: eq.name,
               code: specs.internalCode ? String(specs.internalCode) : eq.externalCode,
               customerName: eq.customer?.companyName || eq.customer?.name || null,
+              openTicketId: openTicket?.id || null,
+              openTicketStatus: openTicket?.status || null,
             };
           }
         }

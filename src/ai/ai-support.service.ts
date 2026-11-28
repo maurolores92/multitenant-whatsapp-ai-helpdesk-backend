@@ -27,6 +27,20 @@ import {
 } from './ai-prompt.helper';
 import { resolveTenantAgent } from '../agents/agents.helper';
 
+interface EscalationPayloadData {
+  ticketAction?: 'CREATE' | 'APPEND_NOTES';
+  existingTicketId?: string | null;
+  reason: string;
+  ticketReason: TicketReason;
+  problemTypeId?: string;
+  serviceType: ServiceType;
+  priority: TicketPriority;
+  diagnosticSummary: string;
+  additionalNotes?: string;
+  equipmentId?: string;
+  resolvedCustomerId?: string;
+}
+
 interface PreparedCustomerReply {
   tenantId: string;
   agentId?: string;
@@ -34,16 +48,7 @@ interface PreparedCustomerReply {
   customer: { id: string; name: string; phone: string };
   replyText: string;
   shouldEscalate: boolean;
-  escalationData?: {
-    reason: string;
-    ticketReason: TicketReason;
-    problemTypeId?: string;
-    serviceType: ServiceType;
-    priority: TicketPriority;
-    diagnosticSummary: string;
-    equipmentId?: string;
-    resolvedCustomerId?: string;
-  };
+  escalationData?: EscalationPayloadData;
 }
 
 interface PendingReplyEntry {
@@ -290,18 +295,22 @@ export class AiSupportService implements OnModuleDestroy {
   private async dispatchPreparedReply(prepared: PreparedCustomerReply) {
     const { tenantId, agentId, conversationId, customer, replyText, shouldEscalate, escalationData } = prepared;
 
-    if (shouldEscalate && escalationData) {
+    if (escalationData && (shouldEscalate || escalationData.ticketAction === 'APPEND_NOTES' || escalationData.ticketAction === 'CREATE')) {
       await this.escalateToHuman({
         tenantId,
         agentId,
         conversationId,
         customerId: escalationData.resolvedCustomerId || customer.id,
+        ticketAction: escalationData.ticketAction,
+        existingTicketId: escalationData.existingTicketId,
+        shouldEscalate,
         reason: escalationData.reason,
         ticketReason: escalationData.ticketReason,
         problemTypeId: escalationData.problemTypeId,
         serviceType: escalationData.serviceType,
         priority: escalationData.priority,
         diagnosticSummary: escalationData.diagnosticSummary,
+        additionalNotes: escalationData.additionalNotes,
         equipmentId: escalationData.equipmentId,
       });
     }
@@ -351,16 +360,7 @@ export class AiSupportService implements OnModuleDestroy {
   }): Promise<{
     replyText: string;
     shouldEscalate: boolean;
-    escalationData?: {
-      reason: string;
-      ticketReason: TicketReason;
-      problemTypeId?: string;
-      serviceType: ServiceType;
-      priority: TicketPriority;
-      diagnosticSummary: string;
-      equipmentId?: string;
-      resolvedCustomerId?: string;
-    };
+    escalationData?: EscalationPayloadData;
   }> {
     const { tenant, customer, recentMessages, latestMessage } = params;
 
@@ -399,6 +399,7 @@ export class AiSupportService implements OnModuleDestroy {
             codClient: m.codClient,
             customerCompanyName: m.customer?.companyName || null,
             customerName: m.customer?.name || null,
+            activeTickets: m.activeTickets,
           })),
           recentMessages,
           latestMessage,
@@ -428,7 +429,13 @@ export class AiSupportService implements OnModuleDestroy {
 
         const { replyText, escalationPayload } = parseEscalationOutput(rawAiText);
 
-        if (escalationPayload?.shouldEscalate) {
+        const hasActionableTicketPayload =
+          escalationPayload &&
+          (escalationPayload.shouldEscalate ||
+            escalationPayload.ticketAction === 'CREATE' ||
+            escalationPayload.ticketAction === 'APPEND_NOTES');
+
+        if (hasActionableTicketPayload) {
           const validProblem = tenant.problemTypes?.find((pt: any) => pt.id === escalationPayload.problemTypeId);
           const candidateEquipmentId = escalationPayload.equipmentId || matchedEquipmentId;
           let resolvedEquipmentId: string | undefined;
@@ -451,12 +458,19 @@ export class AiSupportService implements OnModuleDestroy {
             }
           }
 
+          const requestedAction: 'CREATE' | 'APPEND_NOTES' =
+            escalationPayload.ticketAction === 'APPEND_NOTES' ? 'APPEND_NOTES' : 'CREATE';
+          const shouldEscalateFlag =
+            requestedAction === 'CREATE' ? true : Boolean(escalationPayload.shouldEscalate);
+
           return {
             replyText:
               replyText ||
               `Hemos registrado tu solicitud y derivado el caso a nuestro equipo de ${tenant.name}.`,
-            shouldEscalate: true,
+            shouldEscalate: shouldEscalateFlag,
             escalationData: {
+              ticketAction: requestedAction,
+              existingTicketId: escalationPayload.existingTicketId || null,
               reason: escalationPayload.reason || validProblem?.name || 'Derivación solicitada por IA',
               ticketReason: Object.values(TicketReason).includes(escalationPayload.ticketReason)
                 ? escalationPayload.ticketReason
@@ -469,7 +483,9 @@ export class AiSupportService implements OnModuleDestroy {
               priority: Object.values(TicketPriority).includes(escalationPayload.priority)
                 ? escalationPayload.priority
                 : TicketPriority.HIGH,
-              diagnosticSummary: escalationPayload.diagnosticSummary || latestMessage,
+              diagnosticSummary:
+                escalationPayload.diagnosticSummary || escalationPayload.additionalNotes || latestMessage,
+              additionalNotes: escalationPayload.additionalNotes || undefined,
               equipmentId: resolvedEquipmentId,
               resolvedCustomerId: resolvedCustomerId || customer.id,
             },
@@ -504,19 +520,23 @@ export class AiSupportService implements OnModuleDestroy {
   }
 
   /**
-   * Crea el ticket generado por la IA y notifica al equipo de la compañía
+   * Crea el ticket generado por la IA o agrega notas a un ticket abierto existente (evitando duplicados).
    */
   private async escalateToHuman(params: {
     tenantId: string;
     agentId?: string;
     conversationId: string;
     customerId: string;
+    ticketAction?: 'CREATE' | 'APPEND_NOTES';
+    existingTicketId?: string | null;
+    shouldEscalate?: boolean;
     reason: string;
     ticketReason?: TicketReason;
     problemTypeId?: string;
     serviceType: ServiceType;
     priority: TicketPriority;
     diagnosticSummary: string;
+    additionalNotes?: string;
     equipmentId?: string;
   }) {
     const {
@@ -524,14 +544,122 @@ export class AiSupportService implements OnModuleDestroy {
       agentId,
       conversationId,
       customerId,
+      existingTicketId,
+      shouldEscalate = true,
       reason,
       ticketReason,
       problemTypeId,
       serviceType,
       priority,
       diagnosticSummary,
+      additionalNotes,
       equipmentId,
     } = params;
+
+    const closedStatuses = [TicketStatus.RESOLVED, TicketStatus.CANCELLED];
+
+    // Guard anti-duplicación en PostgreSQL: verificar si ya existe ticket abierto para este equipo o conversación
+    let openTicket = existingTicketId
+      ? await this.prisma.ticket.findFirst({
+          where: {
+            id: existingTicketId,
+            tenantId,
+            status: { notIn: closedStatuses },
+          },
+        })
+      : null;
+
+    if (!openTicket && equipmentId) {
+      openTicket = await this.prisma.ticket.findFirst({
+        where: {
+          tenantId,
+          equipmentId,
+          status: { notIn: closedStatuses },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+    }
+
+    if (!openTicket && !equipmentId) {
+      openTicket = await this.prisma.ticket.findFirst({
+        where: {
+          tenantId,
+          conversationId,
+          status: { notIn: closedStatuses },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+    }
+
+    if (openTicket) {
+      const noteContent = (additionalNotes || diagnosticSummary || reason).trim();
+      const timestampLabel = new Date().toLocaleString('es-AR');
+      const noteLine = `[Actualización WhatsApp IA - ${timestampLabel}]: ${noteContent}`;
+
+      const updatedDiagnostic = openTicket.aiDiagnostic
+        ? `${openTicket.aiDiagnostic}\n\n${noteLine}`
+        : noteLine;
+      const updatedDescription = openTicket.description
+        ? `${openTicket.description}\n\n${noteLine}`
+        : noteLine;
+
+      const updatedTicket = await this.prisma.ticket.update({
+        where: { id: openTicket.id },
+        data: {
+          aiDiagnostic: updatedDiagnostic,
+          description: updatedDescription,
+          ...(openTicket.equipmentId ? {} : equipmentId ? { equipmentId } : {}),
+        },
+      });
+
+      if (shouldEscalate) {
+        await this.prisma.conversation.update({
+          where: { id: conversationId },
+          data: {
+            status: ConversationStatus.WAITING_AGENT,
+            aiDiagnostic: updatedDiagnostic,
+          },
+        });
+      } else {
+        await this.prisma.conversation.update({
+          where: { id: conversationId },
+          data: { aiDiagnostic: updatedDiagnostic },
+        });
+      }
+
+      await this.notificationsService.notify({
+        tenantId,
+        type: 'ticket.updated',
+        title: `Nota agregada al Ticket #${updatedTicket.id.slice(-4).toUpperCase()}`,
+        body: noteContent,
+        link: `/tickets`,
+      });
+
+      this.eventsGateway.emitToTenant(tenantId, 'chat:conversation_updated', {
+        conversationId,
+        ...(shouldEscalate ? { status: ConversationStatus.WAITING_AGENT } : {}),
+        aiDiagnostic: updatedDiagnostic,
+        ticketId: updatedTicket.id,
+      });
+
+      await this.auditService.log({
+        tenantId,
+        action: 'TICKET_NOTES_APPENDED_BY_AI',
+        entity: 'Ticket',
+        entityId: updatedTicket.id,
+        payload: {
+          conversationId,
+          equipmentId: equipmentId || updatedTicket.equipmentId || null,
+          additionalNotes: noteContent,
+        },
+      });
+
+      this.logger.log(
+        `[AI Anti-Duplicate] Conversación ${conversationId} -> Nota agregada a ticket abierto existente ${updatedTicket.id}`,
+      );
+
+      return updatedTicket;
+    }
 
     await this.prisma.conversation.update({
       where: { id: conversationId },

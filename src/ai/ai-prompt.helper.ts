@@ -7,6 +7,7 @@ import {
   Message,
   ProblemType,
   SenderType,
+  TicketStatus,
 } from '@prisma/client';
 import {
   Content,
@@ -39,9 +40,15 @@ PROTOCOLO TÉCNICO INTERNO DE IDENTIFICACIÓN DE EQUIPO Y DERIVACIÓN (NO MOSTRA
 - Evalúa la consulta usando exclusivamente la DIRECTIVA BASE, las REGLAS DE OBLIGATORIO CUMPLIMIENTO, la BASE DE CONOCIMIENTOS y el CATÁLOGO DE PROBLEMAS DEL ERP configurados para la empresa.
 - IMPORTANTE SOBRE IDENTIFICACIÓN DEL CLIENTE: No asumas quién es el cliente por su número de WhatsApp. El cliente y la máquina se identifican mediante el **ID, código interno o número de serie del equipo**.
 - Si el cliente todavía no indicó el ID/código/serie del equipo afectado, pídeselo amablemente antes de crear el ticket (salvo que la consulta sea meramente general o administrativa que no requiera equipo).
-- Apenas el cliente mencione un ID, código o número de serie de máquina, DEBES llamar primero a la herramienta \`buscar_equipo_por_id\` para consultar la base de datos y obtener el \`equipmentId\` real y los datos del cliente propietario (vía \`codClient\`).
-- Una vez identificado el equipo y conocido el problema (y si no pudiste resolverlo según las reglas de la empresa), clasifica el problema usando el CATÁLOGO DE PROBLEMAS DEL ERP y agrega al final de tu respuesta una única línea exacta sin bloques de código Markdown:
-ESCALATION_JSON:{"shouldEscalate":true,"reason":"Resumen corto del motivo","ticketReason":"MECHANICAL_FAILURE"|"ELECTRICAL_ERROR"|"TONER_SUPPLIES"|"CALIBRATION_SOFTWARE"|"PREVENTIVE_MAINTENANCE"|"ADMINISTRATIVE"|"OTHER","problemTypeId":"ID exacto del catálogo de problemas ERP o null","serviceType":"REMOTE_WHATSAPP"|"ONSITE_PHYSICAL","priority":"LOW"|"MEDIUM"|"HIGH"|"CRITICAL","diagnosticSummary":"Diagnóstico técnico detallado incluyendo equipo y cliente identificado","equipmentId":"ID exacto (UUID) del equipo obtenido con buscar_equipo_por_id o null"}
+- Apenas el cliente mencione un ID, código o número de serie de máquina, DEBES llamar primero a la herramienta \`buscar_equipo_por_id\` (si no vino ya pre-cargado en EQUIPOS ASOCIADOS) para obtener el \`equipmentId\`, los datos del cliente (vía \`codClient\`) y si el equipo ya tiene un **TICKET ABIERTO EXISTENTE**.
+- REGLA ANTI-DUPLICACIÓN OBLIGATORIA:
+  1) Si el equipo ya tiene un **[TICKET ABIERTO EXISTENTE]** (estado distinto de RESOLVED/CANCELLED) y el cliente agrega aclaraciones, datos extra (ej. modalidad de alquiler, horario, detalle adicional del síntoma) o sigue consultando por el mismo caso: **NO CREES UN TICKET NUEVO**. Debes emitir \`"ticketAction":"APPEND_NOTES"\`, \`"existingTicketId":"<UUID del ticket abierto>"\`, \`"shouldEscalate":false\`, y colocar el detalle en \`"additionalNotes"\`.
+  2) Si **NO** existe ningún ticket abierto para ese equipo y no pudiste resolver la consulta según las reglas, clasifica el problema usando el CATÁLOGO DE PROBLEMAS DEL ERP y emite \`"ticketAction":"CREATE"\`, \`"existingTicketId":null\`, \`"shouldEscalate":true\`.
+- Agrega al final de tu respuesta una única línea exacta sin bloques de código Markdown:
+  - Caso ticket nuevo:
+ESCALATION_JSON:{"ticketAction":"CREATE","existingTicketId":null,"shouldEscalate":true,"reason":"Resumen corto del motivo","ticketReason":"MECHANICAL_FAILURE"|"ELECTRICAL_ERROR"|"TONER_SUPPLIES"|"CALIBRATION_SOFTWARE"|"PREVENTIVE_MAINTENANCE"|"ADMINISTRATIVE"|"OTHER","problemTypeId":"ID exacto del catálogo de problemas ERP o null","serviceType":"REMOTE_WHATSAPP"|"ONSITE_PHYSICAL","priority":"LOW"|"MEDIUM"|"HIGH"|"CRITICAL","diagnosticSummary":"Diagnóstico técnico detallado incluyendo equipo y cliente identificado","equipmentId":"ID exacto (UUID) del equipo o null"}
+  - Caso agregar nota a ticket ya abierto:
+ESCALATION_JSON:{"ticketAction":"APPEND_NOTES","existingTicketId":"UUID exacto del ticket abierto","shouldEscalate":false,"equipmentId":"ID exacto (UUID) del equipo o null","additionalNotes":"Resumen claro de los nuevos datos o aclaraciones aportadas por el cliente"}
 `.trim();
 
 /**
@@ -131,6 +138,12 @@ export function buildCustomerConversationContext(params: {
     codClient?: string | null;
     customerCompanyName?: string | null;
     customerName?: string | null;
+    activeTickets?: Array<{
+      ticketId: string;
+      status: string;
+      title: string;
+      summary?: string | null;
+    }>;
   }>;
   recentMessages: Pick<Message, 'senderType' | 'content'>[];
   latestMessage: string;
@@ -140,10 +153,21 @@ export function buildCustomerConversationContext(params: {
   const eqText =
     equipments.length > 0
       ? equipments
-          .map(
-            (eq) =>
-              `- [ID: ${eq.id}] ${eq.name} (N°/Cod. máquina: ${eq.internalCode || eq.externalCode || 'N/A'}, codClient: ${eq.codClient || eq.clientCode || 'N/A'}, Cliente dueño: ${eq.customerCompanyName || eq.customerName || 'N/A'}, Marca: ${eq.brand || 'N/A'}, Modelo: ${eq.model || 'N/A'}, S/N: ${eq.serialNumber || 'N/A'})`,
-          )
+          .map((eq) => {
+            const openTicketsLine =
+              eq.activeTickets && eq.activeTickets.length > 0
+                ? `\n  -> TICKET ABIERTO EXISTENTE (NO DUPLICAR): ${eq.activeTickets
+                    .map(
+                      (t) =>
+                        `[existingTicketId="${t.ticketId}", status="${t.status}", title="${t.title}"${
+                          t.summary ? `, resumen="${t.summary.slice(0, 180)}"` : ''
+                        }]`,
+                    )
+                    .join(' | ')}`
+                : '\n  -> Sin tickets abiertos actualmente para este equipo.';
+
+            return `- [ID: ${eq.id}] ${eq.name} (N°/Cod. máquina: ${eq.internalCode || eq.externalCode || 'N/A'}, codClient: ${eq.codClient || eq.clientCode || 'N/A'}, Cliente dueño: ${eq.customerCompanyName || eq.customerName || 'N/A'}, Marca: ${eq.brand || 'N/A'}, Modelo: ${eq.model || 'N/A'}, S/N: ${eq.serialNumber || 'N/A'})${openTicketsLine}`;
+          })
           .join('\n')
       : 'Pendiente: aún no se identificó el equipo. Solicita el ID/código/serie del equipo y usa la herramienta buscar_equipo_por_id.';
 
@@ -306,6 +330,13 @@ export async function findEquipmentAndClientByCode(
       address: string | null;
       locality: string | null;
     } | null;
+    activeTickets: Array<{
+      ticketId: string;
+      status: string;
+      title: string;
+      summary: string | null;
+      createdAt: string;
+    }>;
   }>;
 }> {
   const clean = rawCode.trim().replace(/^#/, '');
@@ -380,6 +411,26 @@ export async function findEquipmentAndClientByCode(
         any
       >;
 
+      const activeTickets = await prisma.ticket.findMany({
+        where: {
+          tenantId,
+          equipmentId: eq.id,
+          status: {
+            notIn: [TicketStatus.RESOLVED, TicketStatus.CANCELLED],
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 3,
+        select: {
+          id: true,
+          status: true,
+          title: true,
+          aiDiagnostic: true,
+          description: true,
+          createdAt: true,
+        },
+      });
+
       return {
         equipmentId: eq.id,
         externalCode: eq.externalCode,
@@ -401,6 +452,13 @@ export async function findEquipmentAndClientByCode(
               locality: resolvedCustomer.locality,
             }
           : null,
+        activeTickets: activeTickets.map((t) => ({
+          ticketId: t.id,
+          status: t.status,
+          title: t.title,
+          summary: t.aiDiagnostic || t.description || null,
+          createdAt: t.createdAt.toISOString(),
+        })),
       };
     }),
   );
