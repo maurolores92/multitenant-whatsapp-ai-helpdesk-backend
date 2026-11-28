@@ -182,11 +182,35 @@ export function buildCustomerConversationContext(params: {
     .slice(-20)
     .map((m) => `${senderLabel[m.senderType] || m.senderType}: ${m.content}`);
 
+  const now = new Date();
+  const argDateParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(now);
+  const weekdayPart = argDateParts.find((p) => p.type === 'weekday')?.value || '';
+  const hourNum = Number(argDateParts.find((p) => p.type === 'hour')?.value ?? 12);
+  const isWeekday = !['Sat', 'Sun'].includes(weekdayPart);
+  const isBusinessHours = isWeekday && hourNum >= 8 && hourNum < 18;
+  const formattedArgNow = new Intl.DateTimeFormat('es-AR', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    weekday: 'long',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(now);
+
   const clientHeader = customerExternalCode
     ? `${customerName} (codClient: ${customerExternalCode})`
     : `${customerName} (cliente aún no identificado por equipo; pedir ID/código del equipo)`;
 
   return [
+    `FECHA Y HORA ACTUAL (Argentina): ${formattedArgNow} hs — ${isBusinessHours ? 'EN HORARIO LABORAL (L-V 08:00 a 18:00 hs)' : 'FUERA DE HORARIO LABORAL'}`,
     `CONTACTO EN CHAT: ${clientHeader}`,
     `EQUIPOS ASOCIADOS:\n${eqText}`,
     historyLines.length > 0 ? `HISTORIAL RECIENTE DE LA CONVERSACIÓN:\n${historyLines.join('\n')}` : '',
