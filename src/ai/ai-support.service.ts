@@ -18,6 +18,7 @@ import {
 import {
   buildCustomerConversationContext,
   buildTenantAiSystemInstructions,
+  extractImagePartsFromMessages,
   findEquipmentAndClientByCode,
   generateGeminiWithEquipmentTools,
   parseEscalationOutput,
@@ -405,6 +406,8 @@ export class AiSupportService implements OnModuleDestroy {
           latestMessage,
         });
 
+        const imageParts = extractImagePartsFromMessages(recentMessages);
+
         const {
           text: rawAiText,
           modelUsed,
@@ -418,6 +421,7 @@ export class AiSupportService implements OnModuleDestroy {
           systemInstruction: systemInstructions,
           userContext,
           temperature: tenant.aiTemperature ?? 0.2,
+          imageParts,
           initialMatchedEquipmentId: uniquePreMatch?.equipmentId,
           initialMatchedCustomerId: uniquePreMatch?.customer?.customerId,
         });
@@ -429,13 +433,14 @@ export class AiSupportService implements OnModuleDestroy {
 
         const { replyText, escalationPayload } = parseEscalationOutput(rawAiText);
 
-        const hasActionableTicketPayload =
-          escalationPayload &&
-          (escalationPayload.shouldEscalate ||
-            escalationPayload.ticketAction === 'CREATE' ||
-            escalationPayload.ticketAction === 'APPEND_NOTES');
+        const isCreateRequest =
+          Boolean(escalationPayload?.shouldEscalate) &&
+          escalationPayload?.ticketAction !== 'APPEND_NOTES';
+        const isAppendRequest =
+          escalationPayload?.ticketAction === 'APPEND_NOTES' &&
+          Boolean(escalationPayload?.existingTicketId);
 
-        if (hasActionableTicketPayload) {
+        if (escalationPayload && (isCreateRequest || isAppendRequest)) {
           const validProblem = tenant.problemTypes?.find((pt: any) => pt.id === escalationPayload.problemTypeId);
           const candidateEquipmentId = escalationPayload.equipmentId || matchedEquipmentId;
           let resolvedEquipmentId: string | undefined;
@@ -458,8 +463,9 @@ export class AiSupportService implements OnModuleDestroy {
             }
           }
 
-          const requestedAction: 'CREATE' | 'APPEND_NOTES' =
-            escalationPayload.ticketAction === 'APPEND_NOTES' ? 'APPEND_NOTES' : 'CREATE';
+          const requestedAction: 'CREATE' | 'APPEND_NOTES' = isAppendRequest
+            ? 'APPEND_NOTES'
+            : 'CREATE';
           const shouldEscalateFlag =
             requestedAction === 'CREATE' ? true : Boolean(escalationPayload.shouldEscalate);
 

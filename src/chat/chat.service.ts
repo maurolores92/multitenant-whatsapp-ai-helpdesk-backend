@@ -39,8 +39,10 @@ export class ChatService {
     customerName?: string;
     text: string;
     whatsappMessageId: string;
+    mediaUrl?: string;
+    mediaType?: string;
   }) {
-    const { tenantId, agentId, fromPhone, customerName, text, whatsappMessageId } = params;
+    const { tenantId, agentId, fromPhone, customerName, text, whatsappMessageId, mediaUrl, mediaType } = params;
     const resolvedAgent = await resolveTenantAgent(this.prisma, tenantId, { agentId });
     const targetAgentId = resolvedAgent?.id;
 
@@ -151,6 +153,8 @@ export class ChatService {
         senderType: SenderType.CUSTOMER,
         content: text,
         whatsappMessageId,
+        mediaUrl: mediaUrl || null,
+        mediaType: mediaType || null,
       },
     });
 

@@ -14,6 +14,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChatService } from '../chat/chat.service';
 import { ensureDefaultTechnicalAgent } from '../agents/agents.helper';
+import { MetaCloudApiService } from './providers/meta-cloud-api.service';
 
 @Controller('whatsapp/webhook')
 export class WhatsAppWebhookController {
@@ -23,6 +24,7 @@ export class WhatsAppWebhookController {
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly chatService: ChatService,
+    private readonly metaCloudApiService: MetaCloudApiService,
   ) {}
 
   /**
@@ -114,31 +116,58 @@ export class WhatsAppWebhookController {
             continue;
           }
 
-          // 2. Procesar mensajes de texto entrantes
+          // 2. Procesar mensajes entrantes (texto e imágenes)
           const messages = value.messages ?? [];
           const contacts = value.contacts ?? [];
 
           for (const msg of messages) {
-            if (msg.type !== 'text') {
-              this.logger.log(`Mensaje de tipo no soportado por ahora (${msg.type}) de ${msg.from}`);
-              continue;
-            }
-
             const fromPhone = msg.from;
-            const text = msg.text?.body;
             const whatsappMessageId = msg.id;
             const customerName = contacts.find((c: any) => c.wa_id === fromPhone)?.profile?.name;
 
-            if (text && fromPhone) {
+            if (!fromPhone) continue;
+
+            if (msg.type === 'text') {
+              const text = msg.text?.body;
+              if (text) {
+                await this.chatService.handleIncomingCustomerMessage({
+                  tenantId: tenant.id,
+                  agentId: agent?.id,
+                  fromPhone,
+                  customerName,
+                  text,
+                  whatsappMessageId,
+                });
+              }
+              continue;
+            }
+
+            if (msg.type === 'image') {
+              const mediaId = msg.image?.id;
+              const caption = msg.image?.caption?.trim();
+              const downloaded = mediaId
+                ? await this.metaCloudApiService.downloadMedia({
+                    tenantId: tenant.id,
+                    agentId: agent?.id,
+                    mediaId,
+                    fallbackMimeType: msg.image?.mime_type || 'image/jpeg',
+                  })
+                : null;
+
               await this.chatService.handleIncomingCustomerMessage({
                 tenantId: tenant.id,
                 agentId: agent?.id,
                 fromPhone,
                 customerName,
-                text,
+                text: caption || '[Imagen enviada por el cliente]',
                 whatsappMessageId,
+                mediaUrl: downloaded?.dataUrl,
+                mediaType: downloaded?.mimeType || msg.image?.mime_type || 'image/jpeg',
               });
+              continue;
             }
+
+            this.logger.log(`Mensaje de tipo no soportado por ahora (${msg.type}) de ${msg.from}`);
           }
         }
       }

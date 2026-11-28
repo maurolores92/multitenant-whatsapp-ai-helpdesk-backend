@@ -15,6 +15,7 @@ import { AgentArea, SenderType } from '@prisma/client';
 import {
   buildCustomerConversationContext,
   buildTenantAiSystemInstructions,
+  extractImagePartsFromMessages,
   generateGeminiWithEquipmentTools,
   parseEscalationOutput,
   prelookupEquipmentsFromTexts,
@@ -445,7 +446,9 @@ export class AiTrainingService {
     message: string,
     scope?: AgentScopeOptions,
     history: SimulateMessageItemDto[] = [],
+    imageInput?: { imageBase64?: string; imageMimeType?: string },
   ) {
+    const effectiveMessage = message.trim() || (imageInput?.imageBase64 ? '[Imagen enviada por el cliente]' : '');
     const startTime = Date.now();
 
     const tenant = await this.prisma.tenant.findUnique({
@@ -495,7 +498,7 @@ export class AiTrainingService {
     const contextHours = agent?.aiContextHours ?? 24;
     const cutoffMs = Date.now() - contextHours * 60 * 60 * 1000;
 
-    const recentMessages = isTechnicalService
+    const validHistory = isTechnicalService
       ? history
           .filter((item) => {
             if (!item.timestamp) return true;
@@ -503,11 +506,19 @@ export class AiTrainingService {
             return Number.isNaN(parsedTime) || parsedTime >= cutoffMs;
           })
           .slice(-20)
-          .map((item) => ({
-            senderType: item.sender === 'user' ? SenderType.CUSTOMER : SenderType.BOT,
-            content: item.text,
-          }))
       : [];
+
+    const recentMessages = validHistory.map((item) => ({
+      senderType: item.sender === 'user' ? SenderType.CUSTOMER : SenderType.BOT,
+      content: item.text.replace(/\n*\[Simulación de Ticket IA\]:[\s\S]*$/m, '').trim(),
+    }));
+
+    const imageParts = extractImagePartsFromMessages(
+      validHistory.map((item) => ({ mediaUrl: item.imageDataUrl })),
+      imageInput?.imageBase64
+        ? [{ base64: imageInput.imageBase64, mimeType: imageInput.imageMimeType || 'image/jpeg' }]
+        : [],
+    );
 
     // Determinar API Key de Gemini: prioriza la del agente/tenant, con fallback a la del sistema
     const apiKey =
@@ -520,7 +531,7 @@ export class AiTrainingService {
     );
     const temperature = agent?.aiTemperature ?? tenant.aiTemperature ?? 0.2;
     const aiEnabled = agent?.aiEnabled ?? tenant.aiEnabled;
-    const systemInstructions = `${buildTenantAiSystemInstructions(effectiveContext, { latestMessage: message })}\n\n${TICKET_ESCALATION_PROTOCOL}`;
+    const systemInstructions = `${buildTenantAiSystemInstructions(effectiveContext, { latestMessage: effectiveMessage })}\n\n${TICKET_ESCALATION_PROTOCOL}`;
 
     let responseText = '';
     let isLiveAi = false;
@@ -541,7 +552,7 @@ export class AiTrainingService {
           .slice(-3)
           .map((m) => m.content);
         const prematched = await prelookupEquipmentsFromTexts(this.prisma, tenant.id, [
-          message,
+          effectiveMessage,
           ...customerHistoryTexts,
         ]);
         const uniquePreMatch = prematched.length === 1 ? prematched[0] : undefined;
@@ -563,7 +574,7 @@ export class AiTrainingService {
             activeTickets: m.activeTickets,
           })),
           recentMessages,
-          latestMessage: message,
+          latestMessage: effectiveMessage,
         });
         const { text: rawText, modelUsed, matchedEquipmentId } = await generateGeminiWithEquipmentTools({
           client,
@@ -573,6 +584,7 @@ export class AiTrainingService {
           systemInstruction: systemInstructions,
           userContext,
           temperature,
+          imageParts,
           initialMatchedEquipmentId: uniquePreMatch?.equipmentId,
           initialMatchedCustomerId: uniquePreMatch?.customer?.customerId,
         });
@@ -608,7 +620,12 @@ export class AiTrainingService {
           }
         }
         const parsed = parseEscalationOutput(rawText);
-        responseText = parsed.escalationPayload
+        const isActionableSimTicket =
+          parsed.escalationPayload &&
+          (Boolean(parsed.escalationPayload.shouldEscalate) ||
+            (parsed.escalationPayload.ticketAction === 'APPEND_NOTES' &&
+              Boolean(parsed.escalationPayload.existingTicketId)));
+        responseText = isActionableSimTicket
           ? `${parsed.replyText}\n\n[Simulación de Ticket IA]: ${JSON.stringify(parsed.escalationPayload)}`
           : parsed.replyText || 'No se recibió respuesta del modelo';
         isLiveAi = true;

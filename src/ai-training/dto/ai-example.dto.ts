@@ -30,12 +30,24 @@ export class SimulateMessageItemDto {
   @IsString()
   @IsOptional()
   timestamp?: string;
+
+  @IsString()
+  @IsOptional()
+  imageDataUrl?: string;
 }
 
 export class SimulateAiDto {
   @IsString()
-  @IsNotEmpty()
-  message: string;
+  @IsOptional()
+  message?: string;
+
+  @IsString()
+  @IsOptional()
+  imageBase64?: string;
+
+  @IsString()
+  @IsOptional()
+  imageMimeType?: string;
 
   @IsArray()
   @ValidateNested({ each: true })

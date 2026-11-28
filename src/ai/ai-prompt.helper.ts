@@ -11,6 +11,7 @@ import {
 } from '@prisma/client';
 import {
   Content,
+  createPartFromBase64,
   createPartFromFunctionResponse,
   FunctionDeclaration,
   GoogleGenAI,
@@ -40,11 +41,13 @@ PROTOCOLO TÉCNICO INTERNO DE IDENTIFICACIÓN DE EQUIPO Y DERIVACIÓN (NO MOSTRA
 - Evalúa la consulta usando exclusivamente la DIRECTIVA BASE, las REGLAS DE OBLIGATORIO CUMPLIMIENTO, la BASE DE CONOCIMIENTOS y el CATÁLOGO DE PROBLEMAS DEL ERP configurados para la empresa.
 - IMPORTANTE SOBRE IDENTIFICACIÓN DEL CLIENTE: No asumas quién es el cliente por su número de WhatsApp. El cliente y la máquina se identifican mediante el **ID, código interno o número de serie del equipo**.
 - Si el cliente todavía no indicó el ID/código/serie del equipo afectado, pídeselo amablemente antes de crear el ticket (salvo que la consulta sea meramente general o administrativa que no requiera equipo).
-- Apenas el cliente mencione un ID, código o número de serie de máquina, DEBES llamar primero a la herramienta \`buscar_equipo_por_id\` (si no vino ya pre-cargado en EQUIPOS ASOCIADOS) para obtener el \`equipmentId\`, los datos del cliente (vía \`codClient\`) y si el equipo ya tiene un **TICKET ABIERTO EXISTENTE**.
+- Apenas el cliente mencione un ID, código o número de serie de máquina —o envíe una **foto de la etiqueta/equipo** donde sea visible ese código o serie— DEBES leerlo y llamar primero a la herramienta \`buscar_equipo_por_id\` (si no vino ya pre-cargado en EQUIPOS ASOCIADOS) para obtener el \`equipmentId\`, los datos del cliente (vía \`codClient\`) y si el equipo ya tiene un **TICKET ABIERTO EXISTENTE**.
+- ANÁLISIS VISUAL DE IMÁGENES: Si el cliente adjunta una imagen (foto de una hoja manchada/rayada, atasco de papel, código de error en display, pieza rota o etiqueta del equipo), analizala cuidadosamente para: (1) extraer el ID/código/modelo del equipo si aparece, (2) diagnosticar la causa probable o aplicar las guías de soluciones rápidas, y (3) incluir una descripción precisa de lo observado en \`diagnosticSummary\`.
 - REGLA ANTI-DUPLICACIÓN OBLIGATORIA:
   1) Si el equipo ya tiene un **[TICKET ABIERTO EXISTENTE]** (estado distinto de RESOLVED/CANCELLED) y el cliente agrega aclaraciones, datos extra (ej. modalidad de alquiler, horario, detalle adicional del síntoma) o sigue consultando por el mismo caso: **NO CREES UN TICKET NUEVO**. Debes emitir \`"ticketAction":"APPEND_NOTES"\`, \`"existingTicketId":"<UUID del ticket abierto>"\`, \`"shouldEscalate":false\`, y colocar el detalle en \`"additionalNotes"\`.
-  2) Si **NO** existe ningún ticket abierto para ese equipo y no pudiste resolver la consulta según las reglas, clasifica el problema usando el CATÁLOGO DE PROBLEMAS DEL ERP y emite \`"ticketAction":"CREATE"\`, \`"existingTicketId":null\`, \`"shouldEscalate":true\`.
-- Agrega al final de tu respuesta una única línea exacta sin bloques de código Markdown:
+  2) Si **NO** existe ningún ticket abierto para ese equipo y YA corresponde derivar en firme según las reglas (falla crítica, insumo/cotización, cliente no registrado, negativa del cliente o falla confirmada tras agotar los intentos de prueba), clasifica el problema usando el CATÁLOGO DE PROBLEMAS DEL ERP y emite \`"ticketAction":"CREATE"\`, \`"existingTicketId":null\`, \`"shouldEscalate":true\`.
+- IMPORTANTE SOBRE CUÁNDO NO EMITIR JSON: Si todavía estás saludando, pidiendo el ID del equipo, respondiendo una duda sobre qué tapa abrir o esperando que el cliente haga una prueba técnica, **NO agregues \`ESCALATION_JSON:\` al final de tu respuesta**. Nunca emitas \`ticketAction:"CREATE"\` con \`shouldEscalate:false\`.
+- Solo cuando corresponda crear o actualizar un ticket, agrega al final de tu respuesta una única línea exacta sin bloques de código Markdown:
   - Caso ticket nuevo:
 ESCALATION_JSON:{"ticketAction":"CREATE","existingTicketId":null,"shouldEscalate":true,"reason":"Resumen corto del motivo","ticketReason":"MECHANICAL_FAILURE"|"ELECTRICAL_ERROR"|"TONER_SUPPLIES"|"CALIBRATION_SOFTWARE"|"PREVENTIVE_MAINTENANCE"|"ADMINISTRATIVE"|"OTHER","problemTypeId":"ID exacto del catálogo de problemas ERP o null","serviceType":"REMOTE_WHATSAPP"|"ONSITE_PHYSICAL","priority":"LOW"|"MEDIUM"|"HIGH"|"CRITICAL","diagnosticSummary":"Diagnóstico técnico detallado incluyendo equipo y cliente identificado","equipmentId":"ID exacto (UUID) del equipo o null"}
   - Caso agregar nota a ticket ya abierto:
@@ -535,8 +538,49 @@ export async function prelookupEquipmentsFromTexts(
   return Array.from(byId.values()).slice(0, 5);
 }
 
+export interface ImageInlineInput {
+  data: string;
+  mimeType: string;
+}
+
 /**
- * Ejecuta Gemini habilitando la herramienta buscar_equipo_por_id para consultar máquinas y su cliente (codClient).
+ * Extrae partes de imagen base64 desde mensajes de chat recientes (máximo últimas 3 imágenes).
+ */
+export function extractImagePartsFromMessages(
+  messages: Array<{ mediaUrl?: string | null; mediaType?: string | null }>,
+  extraImages: Array<{ dataUrl?: string | null; base64?: string | null; mimeType?: string | null }> = [],
+): ImageInlineInput[] {
+  const parts: ImageInlineInput[] = [];
+
+  const pushDataUrl = (rawUrl?: string | null, fallbackMime = 'image/jpeg') => {
+    if (!rawUrl) return;
+    const match = rawUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (match) {
+      parts.push({ mimeType: match[1] || fallbackMime, data: match[2] });
+    }
+  };
+
+  for (const m of messages) {
+    pushDataUrl(m.mediaUrl, m.mediaType || 'image/jpeg');
+  }
+
+  for (const extra of extraImages) {
+    if (extra.dataUrl) {
+      pushDataUrl(extra.dataUrl, extra.mimeType || 'image/jpeg');
+    } else if (extra.base64) {
+      const cleaned = extra.base64.replace(/^data:[^;]+;base64,/, '').trim();
+      if (cleaned) {
+        parts.push({ mimeType: extra.mimeType || 'image/jpeg', data: cleaned });
+      }
+    }
+  }
+
+  return parts.slice(-3);
+}
+
+/**
+ * Ejecuta Gemini habilitando la herramienta buscar_equipo_por_id para consultar máquinas y su cliente (codClient),
+ * e inyecta imágenes adjuntas para visión multimodal (etiquetas, pantallas de error o copias defectuosas).
  */
 export async function generateGeminiWithEquipmentTools(params: {
   client: GoogleGenAI;
@@ -546,6 +590,7 @@ export async function generateGeminiWithEquipmentTools(params: {
   systemInstruction: string;
   userContext: string;
   temperature: number;
+  imageParts?: ImageInlineInput[];
   initialMatchedEquipmentId?: string;
   initialMatchedCustomerId?: string;
 }): Promise<{
@@ -562,10 +607,15 @@ export async function generateGeminiWithEquipmentTools(params: {
     systemInstruction,
     userContext,
     temperature,
+    imageParts = [],
     initialMatchedEquipmentId,
     initialMatchedCustomerId,
   } = params;
-  const contents: Content[] = [{ role: 'user', parts: [{ text: userContext }] }];
+  const userParts: Part[] = [
+    { text: userContext },
+    ...imageParts.map((img) => createPartFromBase64(img.data, img.mimeType)),
+  ];
+  const contents: Content[] = [{ role: 'user', parts: userParts }];
   let lastModelUsed = preferredModel;
   let matchedEquipmentId: string | undefined = initialMatchedEquipmentId;
   let matchedCustomerId: string | undefined = initialMatchedCustomerId;

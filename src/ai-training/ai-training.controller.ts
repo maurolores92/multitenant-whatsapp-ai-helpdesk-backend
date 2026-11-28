@@ -194,6 +194,9 @@ export class AiTrainingController {
     @Query('area') area?: AgentArea,
   ) {
     this.assertTenantAccess(tenantId, user);
-    return this.aiTrainingService.simulate(tenantId, dto.message, { agentId, area }, dto.history);
+    return this.aiTrainingService.simulate(tenantId, dto.message || '', { agentId, area }, dto.history, {
+      imageBase64: dto.imageBase64,
+      imageMimeType: dto.imageMimeType,
+    });
   }
 }
